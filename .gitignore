@@ -1,0 +1,12 @@
+/target/
+/.hypergate/
+/.idea/
+/.cargo/config.toml
+
+*.pdb
+*.profraw
+*.profdata
+*.log
+
+.env
+.env.*

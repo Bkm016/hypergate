@@ -1,0 +1,71 @@
+[package]
+name = "hypergate-version-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "hypergate-version-v1"
+path = "src/bin/hypergate-version-v1.rs"
+
+[[bin]]
+name = "hypergate-version-v2"
+path = "src/bin/hypergate-version-v2.rs"
+
+[workspace]
+members = [
+    "crates/hypergate-app",
+    "crates/hypergate-core",
+    "crates/hypergate-config",
+    "crates/hypergate-cli",
+    "crates/hypergate-gateway",
+]
+resolver = "2"
+default-members = ["crates/hypergate-gateway", "."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["sky"]
+description = "A generic, extensible, multi-version gateway foundation."
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+dbg_macro = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+arc-swap = "1"
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+rustyline = "14"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "net", "time"] }
+
+[dependencies]
+hypergate-app = { path = "crates/hypergate-app" }
+hypergate-config = { path = "crates/hypergate-config" }
+hypergate-core = { path = "crates/hypergate-core" }
+futures-util.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

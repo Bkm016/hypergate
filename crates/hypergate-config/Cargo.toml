@@ -1,0 +1,13 @@
+[package]
+name = "hypergate-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+hypergate-core = { path = "../hypergate-core" }
+
+[lints]
+workspace = true

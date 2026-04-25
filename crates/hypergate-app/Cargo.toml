@@ -1,0 +1,16 @@
+[package]
+name = "hypergate-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[dependencies]
+hypergate-cli = { path = "../hypergate-cli" }
+hypergate-core = { path = "../hypergate-core" }
+axum.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
