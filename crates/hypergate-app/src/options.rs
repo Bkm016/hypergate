@@ -12,14 +12,13 @@ use hypergate_core::{HyperError, HyperResult};
 /// Version app 启动参数。
 ///
 /// 每个 version app 都是独立业务进程,只需要知道自己的进程名和监听
-/// 端口。Gateway 后续用自己的部署配置把 `v1` / `v2` 映射到这些端口。
+/// 端口。Gateway 后续用自己的部署配置把版本槽位映射到这些端口。
 #[derive(Debug, Clone)]
 pub struct VersionAppOptions {
     /// 当前业务进程名称。
     ///
-    /// 默认来自当前可执行文件名,例如 `hypergate-version-v1` 或
-    /// `hypergate-version-v2`。该名称只用于控制台提示,
-    /// 不等同于 gateway 配置里的 version id。
+    /// 默认来自当前可执行文件名。生产环境可以通过复制或重命名同一
+    /// 个可执行文件发布新版本,该名称只用于控制台提示和审计输出。
     pub name: String,
     /// 当前 version 进程监听地址。
     ///
@@ -86,5 +85,5 @@ fn app_name_from_exe() -> String {
             path.file_stem()
                 .map(|name| name.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "hypergate-version-v1".to_owned())
+        .unwrap_or_else(|| "hypergate-app".to_owned())
 }

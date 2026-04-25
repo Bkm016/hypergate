@@ -2,7 +2,7 @@
 
 `hypergate-app` 是业务 version app 的 SDK。它让开发者在自己的项目里组装 HTTP handler、业务配置和控制台指令，再用统一入口启动一个独立业务进程。
 
-Version app 是独立可执行文件。它监听自己的端口，gateway 只通过配置把某个 version id 映射到这个 endpoint。Version app 不接收 `--version`，也不修改 gateway 的 active version。
+Version app 是独立可执行文件。它监听自己的端口，gateway 只通过配置把版本槽位映射到这个 endpoint。Version app 不接收 `--version`，也不修改 gateway 的 active version。
 
 ## Boundary
 
@@ -29,6 +29,7 @@ Version app 是独立可执行文件。它监听自己的端口，gateway 只通
 ```rust
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+use hypergate_app::{VersionApp, axum::Router};
 use hypergate_core::HyperResult;
 
 #[tokio::main]
@@ -40,10 +41,10 @@ async fn main() {
 }
 
 async fn run() -> HyperResult<()> {
-    hypergate_version_app::run(SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::LOCALHOST,
-        9101,
-    )))
+    VersionApp::run_from_env(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9101)),
+        |options| VersionApp::new(options, Router::new()).with_default_console(),
+    )
     .await
 }
 ```
@@ -91,7 +92,7 @@ Version app 可以直接复用 `hypergate-config` 的泛型快照层：
 
 | 项 | 要求 |
 |---|---|
-| 版本身份 | 业务进程名来自可执行文件名，不等同于 gateway version id |
+| 版本身份 | 业务进程名来自可执行文件名，不等同于 gateway 版本槽位 |
 | 启动参数 | 不支持 `--version` |
 | 控制台 | 只控制当前业务进程 |
 | 扩展方式 | 业务通过 builder 和宏注册命令，不修改 SDK crate |

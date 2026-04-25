@@ -15,7 +15,7 @@ pub use hypergate_cli::command::{
     CompletionProvider, RegisteredCommand,
 };
 pub use hypergate_cli::console::ConsoleOptions;
-pub use hypergate_cli::format::render_panel;
+pub use hypergate_cli::format::{Align, Table, column, render_panel};
 pub use hypergate_cli::{hypergate_command, hypergate_commands};
 
 mod app;
