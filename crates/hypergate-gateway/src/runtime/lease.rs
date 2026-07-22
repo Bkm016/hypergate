@@ -1,9 +1,7 @@
 //! 请求租约。租约生命周期直接决定版本活跃连接计数。
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
 use hypergate_core::RequestKind;
+use std::sync::Arc;
 
 use super::VersionRuntime;
 
@@ -18,9 +16,6 @@ pub(crate) struct VersionLease {
 impl Drop for VersionLease {
     /// 释放请求租约时同步扣减版本活跃计数。
     fn drop(&mut self) {
-        self.version.active_requests.fetch_sub(1, Ordering::Relaxed);
-        if matches!(self.kind, RequestKind::Stream) {
-            self.version.active_streams.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.version.release(self.kind);
     }
 }

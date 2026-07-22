@@ -342,6 +342,8 @@ dependencies = [
  "hypergate-cli",
  "hypergate-config",
  "hypergate-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

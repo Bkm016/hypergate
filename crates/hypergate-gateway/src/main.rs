@@ -2,8 +2,10 @@
 
 mod app;
 mod commands;
+mod control;
 mod default_config;
 mod http;
+mod management;
 mod runtime;
 mod views;
 

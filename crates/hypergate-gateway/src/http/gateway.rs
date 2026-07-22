@@ -55,21 +55,42 @@ impl Gateway {
         })
     }
 
-    /// 刷新 active version 热路径快照。
-    pub(crate) fn sync_active(&self, config: &RuntimeConfig) -> HyperResult<()> {
-        let active = Self::build_active_target(config, &self.versions)?;
-        self.active.store(Arc::new(active));
-        Ok(())
+    /// 预构建 active version 热路径快照,由控制层一次性刷新热路径。
+    /// 构建过程不立即影响请求路由。
+    pub(crate) fn prepare_active(
+        &self,
+        config: &RuntimeConfig,
+    ) -> HyperResult<Arc<ActiveVersionTarget>> {
+        Ok(Arc::new(Self::build_active_target(config, &self.versions)?))
+    }
+
+    /// 原子替换 active version 热路径快照并返回旧快照。
+    pub(crate) fn swap_active(&self, active: Arc<ActiveVersionTarget>) -> Arc<ActiveVersionTarget> {
+        self.active.swap(active)
     }
 
     /// 准备处理普通反代请求。切换后新请求读取新的 active 版本,旧请求继续持有旧版本租约。
     pub(crate) fn prepare_proxy(&self, kind: RequestKind) -> HyperResult<PreparedProxyRequest> {
         let active = self.active.load_full();
-        let lease = active.runtime.lease(kind)?;
-        Ok(PreparedProxyRequest {
-            lease,
-            endpoint: active.endpoint.clone(),
-        })
+        match active.runtime.lease(kind) {
+            Ok(lease) => Ok(PreparedProxyRequest {
+                lease,
+                endpoint: active.endpoint.clone(),
+            }),
+            Err(error) => {
+                let current = self.active.load_full();
+                if Arc::ptr_eq(&active, &current) {
+                    return Err(error);
+                }
+                // 请求已读取旧 target 且旧版本随后进入 draining 时,仅对当前
+                // target 重试一次,避免正常切换制造瞬时 502 或无限重试。
+                let lease = current.runtime.lease(kind)?;
+                Ok(PreparedProxyRequest {
+                    lease,
+                    endpoint: current.endpoint.clone(),
+                })
+            }
+        }
     }
 
     /// 根据配置构建可被热路径原子替换的 active version 快照。

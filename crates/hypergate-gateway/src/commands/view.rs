@@ -15,7 +15,7 @@ pub(super) fn status(context: CommandContext<'_>, _args: &[&str]) -> HyperResult
     let config = state.manager.snapshot();
     Ok(CommandOutput {
         summary: "console=status".to_owned(),
-        rendered: format_status(config.as_ref(), state.runtime.as_ref())?,
+        rendered: format_status(config.as_ref(), state.versions.as_ref())?,
     })
 }
 
@@ -27,7 +27,7 @@ pub(super) fn versions(context: CommandContext<'_>, _args: &[&str]) -> HyperResu
         summary: "console=versions".to_owned(),
         rendered: render_tables(vec![versions_table(
             config.as_ref(),
-            state.runtime.as_ref(),
+            state.versions.as_ref(),
         )?]),
     })
 }

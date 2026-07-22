@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use crate::runtime::RuntimeController;
+use crate::runtime::VersionRegistry;
 use hypergate_config::{ConfigValidator, DefaultConfigValidator, RuntimeConfig};
 use hypergate_core::{HyperResult, VersionId, VersionState};
 
@@ -11,9 +11,9 @@ use hypergate_cli::format::{Align, Table, column, render_panel};
 /// 渲染 gateway 当前状态总览。
 pub(crate) fn format_status(
     config: &RuntimeConfig,
-    runtime: &RuntimeController,
+    versions: &VersionRegistry,
 ) -> HyperResult<String> {
-    let summary = version_summary(runtime)?;
+    let summary = version_summary(versions)?;
     Ok(render_panel(
         "Gateway Status",
         Vec::new(),
@@ -81,10 +81,9 @@ pub(crate) fn format_check_result(config: &RuntimeConfig) -> HyperResult<String>
 /// 渲染版本 endpoint、运行状态和连接计数。
 pub(crate) fn versions_table(
     config: &RuntimeConfig,
-    runtime: &RuntimeController,
+    versions: &VersionRegistry,
 ) -> HyperResult<Table> {
-    let rows = runtime
-        .registry
+    let rows = versions
         .snapshots()?
         .into_iter()
         .map(|snapshot| {
@@ -106,6 +105,7 @@ pub(crate) fn versions_table(
                     .unwrap_or_else(|| "-".to_owned()),
                 snapshot.active_requests.to_string(),
                 snapshot.active_streams.to_string(),
+                snapshot.total_requests.to_string(),
                 drain_elapsed,
             ]
         })
@@ -119,6 +119,7 @@ pub(crate) fn versions_table(
             column("health", Align::Left),
             column("requests", Align::Right),
             column("streams", Align::Right),
+            column("total", Align::Right),
             column("drain", Align::Right),
         ],
         rows,
@@ -140,8 +141,8 @@ struct VersionSummary {
 }
 
 /// 从版本快照聚合状态页摘要。
-fn version_summary(runtime: &RuntimeController) -> HyperResult<VersionSummary> {
-    let snapshots = runtime.registry.snapshots()?;
+fn version_summary(versions: &VersionRegistry) -> HyperResult<VersionSummary> {
+    let snapshots = versions.snapshots()?;
     let mut summary = VersionSummary {
         total: snapshots.len(),
         draining: 0,

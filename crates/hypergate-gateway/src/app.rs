@@ -1,15 +1,17 @@
 //! 可复用 gateway 运行器。调用方负责提供运行配置。
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use crate::control::GatewayControl;
 use crate::http::{
     DefaultRequestKindClassifier, Gateway, HttpState, ProxyBodyPolicy, VersionClients,
 };
-use crate::runtime::{RuntimeController, VersionRegistry};
+use crate::management::{ManagementConfig, ManagementState};
+use crate::runtime::VersionRegistry;
 use hypergate_config::{
     ConfigManager, ConfigValidatorChain, DefaultConfigValidator, RuntimeConfig, StaticConfigLoader,
 };
-use hypergate_core::{HyperError, HyperResult, VersionId};
+use hypergate_core::{HyperError, HyperResult};
 
 use hypergate_cli::command::CommandRegistry;
 use hypergate_cli::console::{CommandState, ConsoleOptions, control_loop, spawn_console};
@@ -39,6 +41,8 @@ pub(crate) async fn run(args: Vec<String>, config: RuntimeConfig) -> HyperResult
 /// 启动 HyperGate 和同进程控制台。
 async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResult<()> {
     let listen = config.server.listen;
+    // 管理配置在启动其他线程前校验,避免错误配置留下孤立控制台。
+    let admin = ManagementConfig::from_env()?;
     let loader = Arc::new(StaticConfigLoader {
         template: config.clone(),
     });
@@ -56,11 +60,14 @@ async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResul
     let active = versions
         .get(&config.active_version)?
         .ok_or_else(|| HyperError::new("active version is not registered"))?;
-    active.activate()?;
+    active.activate();
 
     let gateway = Arc::new(Gateway::new(&config, versions.clone())?);
-    let runtime = Arc::new(RuntimeController::new(versions));
-    let history = Arc::new(Mutex::new(Vec::<VersionId>::new()));
+    let control = Arc::new(GatewayControl::new(
+        manager.clone(),
+        gateway.clone(),
+        versions.clone(),
+    ));
     let state = HttpState {
         gateway: gateway.clone(),
         clients: VersionClients::new(),
@@ -71,9 +78,8 @@ async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResul
 
     let command_state: CommandState = Arc::new(GatewayCommandState {
         manager: manager.clone(),
-        gateway: gateway.clone(),
-        runtime: runtime.clone(),
-        history: history.clone(),
+        versions: versions.clone(),
+        control: control.clone(),
     });
     let completion_provider = Arc::new(GatewayCompletionProvider {
         manager: manager.clone(),
@@ -86,10 +92,24 @@ async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResul
         registry.clone(),
         ConsoleOptions::gateway(banner),
     );
-    // HTTP 服务和控制循环共享同一套配置快照与运行时控制器。
+    // HTTP 服务和控制循环共享同一套配置快照与版本运行态。
     tokio::spawn(control_loop(registry, command_state, console_rx));
 
-    crate::http::serve(state, listen).await
+    let proxy_future = crate::http::serve(state, listen);
+    match admin {
+        Some(admin_config) => {
+            let admin_listen = admin_config.listen();
+            let admin_credential = admin_config.into_credential();
+            let admin_state = ManagementState::new(control, admin_credential);
+            let admin_future = crate::management::serve(admin_state, admin_listen);
+            // 管理 listener 与代理 listener 同生命周期,任一失败都让 run_app 返回错误。
+            tokio::select! {
+                result = proxy_future => result,
+                result = admin_future => result,
+            }
+        }
+        None => proxy_future.await,
+    }
 }
 
 /// 打印本地命令帮助。

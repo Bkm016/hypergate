@@ -6,10 +6,10 @@ use hypergate_cli::command::{
 use hypergate_cli::hypergate_commands;
 use hypergate_config::{ConfigManager, RuntimeConfig};
 use hypergate_core::{HyperError, HyperResult};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::http::Gateway;
-use crate::runtime::RuntimeController;
+use crate::control::GatewayControl;
+use crate::runtime::VersionRegistry;
 use crate::views::format_status;
 
 mod lifecycle;
@@ -22,12 +22,10 @@ use view::{config_check, config_show, status, versions};
 pub(crate) struct GatewayCommandState {
     /// 配置管理器。
     pub(crate) manager: Arc<ConfigManager<RuntimeConfig>>,
-    /// HTTP 网关核心。
-    pub(crate) gateway: Arc<Gateway>,
-    /// 运行时控制器。
-    pub(crate) runtime: Arc<RuntimeController>,
-    /// active 版本历史。
-    pub(crate) history: Arc<Mutex<Vec<hypergate_core::VersionId>>>,
+    /// 版本运行态注册表。
+    pub(crate) versions: Arc<VersionRegistry>,
+    /// 生命周期控制入口。
+    pub(crate) control: Arc<GatewayControl>,
 }
 
 /// Gateway 指令补全提供器。
@@ -87,7 +85,7 @@ fn status_after_control(
     let state = gateway_state(context)?;
     let config = state.manager.snapshot();
     Ok(CommandOutput {
-        rendered: format_status(config.as_ref(), state.runtime.as_ref())?,
+        rendered: format_status(config.as_ref(), state.versions.as_ref())?,
         summary,
     })
 }

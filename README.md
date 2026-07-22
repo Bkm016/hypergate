@@ -18,7 +18,7 @@ Gateway 配置中的 `v1`、`v2` 是部署标识，只存在于 gateway 控制�
 
 | 路径 | 发布身份 | 内容 |
 |---|---|---|
-| `crates/hypergate-gateway` | `hypergate` | Gateway 可执行文件，包含 HTTP 转发、版本运行态和 gateway 控制台指令 |
+| `crates/hypergate-gateway` | `hypergate` | Gateway 可执行文件，包含 HTTP 转发、版本运行态、控制台和本机管理 API |
 | `crates/hypergate-app` | `hypergate-app` | Version app SDK，封装启动、监听、控制台接入 |
 | `crates/hypergate-core` | `hypergate-core` | 错误、请求类型、版本状态、扩展注册基础类型 |
 | `crates/hypergate-config` | `hypergate-config` | 泛型配置快照、加载器、校验链和 gateway 运行配置 schema |
@@ -49,9 +49,13 @@ http://127.0.0.1:8080/
 
 默认请求会转发到 gateway 配置中的 active version。当前示例默认 active version 是 `v1`。
 
+可选的本机管理 API 默认关闭。设置 `HYPERGATE_ADMIN_TOKEN` 后启用,默认监听
+`127.0.0.1:8090`;`HYPERGATE_ADMIN_LISTEN` 只能设置为 loopback 地址。接口和
+请求体契约见 `crates/hypergate-gateway/README.md`。
+
 ## Console Commands
 
-Gateway 和 version app 各自拥有独立控制台。指令只能在对应进程的运行中控制台输入，不走文件通道、控制端口或 HTTP 管理 API。
+Gateway 和 version app 各自拥有独立控制台。Gateway 生命周期控制同时可通过默认关闭、仅限本机且要求 Bearer 鉴权的管理 API 执行;version app 指令仍只存在于对应进程控制台。
 
 | 进程 | 指令 | 作用 |
 |---|---|---|
@@ -87,10 +91,11 @@ client
 
 ```text
 version switch v2
+  -> prepare and validate v2 target
   -> v2 becomes active
-  -> previous active version enters draining
+  -> gateway active target is atomically replaced
   -> config snapshot is replaced
-  -> gateway active target is refreshed
+  -> previous active version enters draining
   -> new requests go to v2
   -> old streams keep their original lease
 ```
@@ -129,18 +134,19 @@ version switch v2
 | 多版本切换和回滚 | 已实现 |
 | 长连接租约计数 | 已实现 |
 | Gateway 控制台 | 已实现 |
+| Gateway 本机管理 API | 已实现,默认关闭 |
 | Version app 控制台 SDK | 已实现 |
 | 泛型配置快照 | 已实现 |
 | 文件监听 loader | 未实现 |
 | WebSocket 隧道 | 未实现 |
-| Runtime metrics | 未实现 |
+| Runtime metrics | 已实现版本 active/stream/total 基础指标 |
 
 ## Design Constraints
 
 | 约束 | 说明 |
 |---|---|
-| 不内置 HTTP 管理 API | 控制面只走运行中进程控制台 |
-| 不使用控制文件或控制端口 | 不保留 `.hypergate/control.*`、`control.json` 或额外控制监听 |
+| 管理 API 仅限本机 | 默认关闭,只允许 loopback 监听并要求 Bearer 鉴权 |
+| 不使用控制文件 | 不保留 `.hypergate/control.*`、`control.json` 等文件控制通道 |
 | Gateway 不托管业务进程 | 业务进程由部署系统或用户自行启动 |
 | Version app 不知道 gateway version id | 部署标识只存在于 gateway 配置 |
 | 请求热路径不读写配置锁 | Active target 用快照替换 |

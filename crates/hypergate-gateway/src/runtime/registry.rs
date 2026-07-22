@@ -51,7 +51,7 @@ impl VersionRegistry {
             .map_err(|_| HyperError::new("version registry lock poisoned"))?;
         let mut snapshots = Vec::with_capacity(versions.len());
         for version in versions.values() {
-            snapshots.push(version.snapshot()?);
+            snapshots.push(version.snapshot());
         }
         snapshots.sort_by(|a, b| a.id.value.cmp(&b.id.value));
         Ok(snapshots)
