@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use http::uri::{Authority, Scheme};
 use hypergate_config::{RuntimeConfig, ServerConfig};
 use hypergate_core::{HyperError, HyperResult, RequestKind};
+use tokio_util::task::TaskTracker;
 
 use super::{ProxyBodyPolicy, RequestKindClassifier, VersionClients};
 
@@ -143,4 +144,6 @@ pub(crate) struct HttpState {
     /// `proxy::serve` 据此施加连接上限与请求头超时,`forward_request` 据此
     /// 施加 version app 响应头等待。
     pub(crate) server: ServerConfig,
+    /// 跟踪 HTTP 连接和 WebSocket 隧道，Gateway 关闭时统一排空。
+    pub(crate) tasks: TaskTracker,
 }

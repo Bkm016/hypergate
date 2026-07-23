@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -37,6 +39,8 @@ pub(crate) struct LimitedBodyStream<S> {
     pub(crate) policy: ProxyBodyPolicy,
     /// 已转发字节数。
     pub(crate) forwarded: usize,
+    /// 无 Content-Length 请求体超限时通知代理响应映射为 413。
+    pub(crate) exceeded: Arc<AtomicBool>,
 }
 
 impl<S, E> Stream for LimitedBodyStream<S>
@@ -54,9 +58,12 @@ where
                     self.forwarded = total;
                     Poll::Ready(Some(Ok(chunk)))
                 }
-                _ => Poll::Ready(Some(Err(Box::new(RequestBodyLimitExceeded {
-                    limit: self.policy.max_request_body_bytes,
-                })))),
+                _ => {
+                    self.exceeded.store(true, Ordering::Release);
+                    Poll::Ready(Some(Err(Box::new(RequestBodyLimitExceeded {
+                        limit: self.policy.max_request_body_bytes,
+                    }))))
+                }
             },
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(Box::new(error)))),
             Poll::Ready(None) => Poll::Ready(None),

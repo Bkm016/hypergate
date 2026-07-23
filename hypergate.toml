@@ -1,0 +1,23 @@
+default_version = "v1"
+
+[server]
+listen = "127.0.0.1:8080"
+max_connections = 4096
+header_read_timeout_ms = 30000
+version_connect_timeout_ms = 5000
+version_response_header_timeout_ms = 30000
+version_health_timeout_ms = 5000
+shutdown_timeout_seconds = 1800
+trusted_proxies = ["127.0.0.0/8", "::1/128"]
+
+[drain]
+timeout_seconds = 1800
+force_close_streams = false
+
+[versions.v1]
+endpoint = "http://127.0.0.1:9101"
+health = "http://127.0.0.1:9101/health"
+
+[versions.v2]
+endpoint = "http://127.0.0.1:9102"
+health = "http://127.0.0.1:9102/health"

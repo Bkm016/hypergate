@@ -20,11 +20,11 @@ macro_rules! hypergate_command {
         $(,)?
     ) => {{
         /// 内联命令 handler,由 `hypergate_command!` 在调用点生成。
-        fn __hypergate_inline_command(
-            $context: $crate::command::CommandContext<'_>,
-            _args: &[&str],
-        ) -> $crate::command::CommandResult {
-            $body
+        fn __hypergate_inline_command<'a>(
+            $context: $crate::command::CommandContext<'a>,
+            _args: &'a [&'a str],
+        ) -> $crate::command::CommandFuture<'a> {
+            Box::pin(async move { $body })
         }
         $crate::hypergate_command! {
             $first $($path)* => __hypergate_inline_command, $description
@@ -46,11 +46,11 @@ macro_rules! hypergate_command {
         $(,)?
     ) => {{
         /// 内联命令 handler,由 `hypergate_command!` 在调用点生成。
-        fn __hypergate_inline_command(
-            $context: $crate::command::CommandContext<'_>,
-            $args: &[&str],
-        ) -> $crate::command::CommandResult {
-            $body
+        fn __hypergate_inline_command<'a>(
+            $context: $crate::command::CommandContext<'a>,
+            $args: &'a [&'a str],
+        ) -> $crate::command::CommandFuture<'a> {
+            Box::pin(async move { $body })
         }
         $crate::hypergate_command! {
             $first $($path)* => __hypergate_inline_command, $description

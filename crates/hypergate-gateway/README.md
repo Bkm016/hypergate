@@ -1,6 +1,6 @@
 # hypergate
 
-`hypergate` 是 HyperGate 的 gateway 可执行 crate。它是最小不变单元：对外监听 HTTP 请求，维护 active version，执行多版本切换、回滚和排水，并把请求转发到当前 active version endpoint。
+`hypergate` 是 HyperGate 的 gateway 可执行 crate。它是最小不变单元：对外监听 HTTP/WebSocket 请求，执行健康门禁、多版本切换、回滚和排水，并把请求转发到当前 active version endpoint。
 
 Gateway 不启动业务进程，也不进入业务控制台。业务 version app 由用户或部署系统自行启动。
 
@@ -22,15 +22,16 @@ Gateway 不启动业务进程，也不进入业务控制台。业务 version app
 | `app` | `src/app.rs` | Gateway 启动、控制台、HTTP 服务和管理服务组装 |
 | `commands` | `src/commands/` | Gateway 专属控制台指令 |
 | `control` | `src/control.rs` | 生命周期控制入口,CLI 与 HTTP API 共享 |
-| `default_config` | `src/default_config.rs` | 本地示例配置 |
 | `http` | `src/http/` | HTTP 服务、转发、请求体限制、响应流租约 |
 | `management` | `src/management.rs` | 本机管理 HTTP 服务、Bearer 鉴权和路由 |
+| `options` | `src/options.rs` | `start` / `check` 进程参数和配置路径 |
 | `runtime` | `src/runtime/` | Version 运行态、租约、切换和排水 |
+| `state` | `src/state.rs` | active version、revision 和 rollback history 原子持久化 |
 | `views` | `src/views.rs` | Gateway 控制台输出视图 |
 
 ## Default Runtime
 
-默认配置用于本地开发：
+仓库根目录的 `hypergate.toml` 用于本地开发：
 
 | version | endpoint | health |
 |---|---|---|
@@ -61,8 +62,9 @@ http://127.0.0.1:8080
 | `/api/v1/actions/drain` | POST | 让非 active 版本进入 draining |
 | `/api/v1/actions/stop` | POST | 在连接清空后停止非 active 版本 |
 | `/api/v1/actions/rollback` | POST | 切回上一个 active version |
+| `/api/v1/actions/reload` | POST | 重读 TOML 配置并保留 active version |
 
-`switch` / `drain` / `stop` 请求体包含 `version` 和必填的 `expectedRevision`;`rollback` 请求体只包含必填的 `expectedRevision`。`expectedRevision` 用于乐观并发控制,与当前配置修订号不匹配时返回 409。动作成功后直接返回最新状态快照。
+`switch` / `drain` / `stop` 请求体包含 `version` 和必填的 `expectedRevision`;`rollback` / `reload` 请求体只包含必填的 `expectedRevision`。`expectedRevision` 用于乐观并发控制,与当前配置修订号不匹配时返回 409。动作成功后直接返回最新状态快照。
 
 错误响应为稳定 JSON:
 
@@ -108,6 +110,8 @@ accept connection
 
 请求切换只影响新请求。已经持有租约的请求或流式连接继续绑定原 version。
 
+切换前必须请求目标 version 的 health URL 并得到 2xx。健康失败、超时或探活期间 revision 变化都会拒绝提交。成功切换前先持久化 active version 和 rollback history，Gateway 重启后继续使用已提交版本。
+
 ## Performance Rules
 
 | 热路径约束 | 实现 |
@@ -124,9 +128,10 @@ accept connection
 |---|---|
 | 指令归属 | Gateway 指令只在本 crate 注册 |
 | 进程职责 | 不托管 version app |
-| 控制通道 | 不创建 `.hypergate`、`control.json` 等文件控制通道 |
+| 控制通道 | 私有状态文件只由 Gateway 写入，不作为文件控制通道 |
 | 管理 API | 默认关闭,仅本机 loopback 监听,Bearer 鉴权 |
 | 转发语义 | 保留 method、path、query、body 和端到端 header |
-| Header 处理 | 丢弃逐跳 header 和 framing header |
-| 切换顺序 | 预构建目标、激活新版本、原子切流、提交配置，再排水旧版本 |
+| Header 处理 | 保留端到端 Header，仅丢弃标准和 Connection 声明的逐跳 Header |
+| 切换顺序 | 健康检查、持久化状态、原子切流，再排水旧版本 |
 | 回滚历史 | 只记录实际切换前的 active version |
+| 可信代理 | 只有配置网段可提供 X-Forwarded-*，其他来源会被重建 |

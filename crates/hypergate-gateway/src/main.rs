@@ -3,16 +3,17 @@
 mod app;
 mod commands;
 mod control;
-mod default_config;
 mod http;
 mod management;
+mod options;
 mod runtime;
+mod state;
 mod views;
 
 #[tokio::main]
 async fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if let Err(error) = app::run(args, default_config::default_config()).await {
+    if let Err(error) = app::run(args).await {
         eprintln!("hypergate failed: {error}");
         std::process::exit(1);
     }

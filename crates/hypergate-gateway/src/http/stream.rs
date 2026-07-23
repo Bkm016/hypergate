@@ -1,6 +1,7 @@
 //! 响应流包装器。用于把版本租约绑定到响应流生命周期。
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -14,6 +15,20 @@ pub(crate) struct LeaseStream<S> {
     pub(crate) inner: Pin<Box<S>>,
     /// 请求持有的版本租约。
     pub(crate) lease: Option<VersionLease>,
+    /// 排水强制关闭通知。
+    pub(crate) cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<S> LeaseStream<S> {
+    /// 创建和版本租约及取消令牌绑定的响应流。
+    pub(crate) fn new(inner: S, lease: VersionLease) -> Self {
+        let cancelled = Box::pin(lease.cancel_token().cancelled_owned());
+        Self {
+            inner: Box::pin(inner),
+            lease: Some(lease),
+            cancelled,
+        }
+    }
 }
 
 impl<S> Stream for LeaseStream<S>
@@ -24,6 +39,10 @@ where
 
     /// 转发响应 chunk,并在流结束或出错时释放版本租约。
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            self.lease.take();
+            return Poll::Ready(None);
+        }
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
             Poll::Ready(Some(Err(_))) => {

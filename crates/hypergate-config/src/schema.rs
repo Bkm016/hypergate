@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hypergate_core::{ConfigRevision, HyperError, HyperResult, VersionId};
+use ipnet::IpNet;
 
 /// 对外 HTTP 服务配置。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// HyperGate 对外监听地址。
     pub listen: SocketAddr,
@@ -27,6 +28,12 @@ pub struct ServerConfig {
     /// (含连接建立与请求发送)到响应头返回的整个阶段;响应 body / SSE 流
     /// 不受此限制,避免切断长响应。
     pub version_response_header_timeout: Duration,
+    /// 切换前等待 version app 健康检查响应的时间上限。
+    pub version_health_timeout: Duration,
+    /// Gateway 收到关闭信号后等待现有连接排空的时间上限。
+    pub shutdown_timeout: Duration,
+    /// 允许提供客户端转发头的直接上游代理网段。
+    pub trusted_proxies: Vec<IpNet>,
 }
 
 impl Default for ServerConfig {
@@ -42,31 +49,15 @@ impl Default for ServerConfig {
             version_connect_timeout: Duration::from_secs(5),
             // 30 秒响应头等待覆盖绝大多数普通请求,SSE 的首字节通常也在此之内。
             version_response_header_timeout: Duration::from_secs(30),
-        }
-    }
-}
-
-/// 文件监听配置。
-#[derive(Debug, Clone)]
-pub struct WatchConfig {
-    /// 是否启用配置文件监听。
-    pub enabled: bool,
-    /// 文件变更合并延迟。
-    pub debounce: Duration,
-}
-
-impl Default for WatchConfig {
-    /// 默认启用文件监听并合并短时间内的重复变更。
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            debounce: Duration::from_millis(500),
+            version_health_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(30 * 60),
+            trusted_proxies: Vec::new(),
         }
     }
 }
 
 /// 长连接排水配置。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainConfig {
     /// draining 版本最多等待已有连接的时间。
     pub timeout: Duration,
@@ -85,12 +76,12 @@ impl Default for DrainConfig {
 }
 
 /// 单个运行版本配置。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionConfig {
     /// Version app HTTP 入口地址。
     pub endpoint: String,
-    /// 健康检查地址。运行时可以据此扩展探活策略。
-    pub health: Option<String>,
+    /// 切换前必须返回 2xx 的健康检查地址。
+    pub health: String,
 }
 
 /// HyperGate 运行时配置。
@@ -104,8 +95,6 @@ pub struct RuntimeConfig {
     pub active_version: VersionId,
     /// 多版本 endpoint 配置。
     pub versions: HashMap<VersionId, VersionConfig>,
-    /// 文件监听配置。
-    pub watch: WatchConfig,
     /// 长连接排水配置。
     pub drain: DrainConfig,
 }
@@ -118,7 +107,6 @@ impl RuntimeConfig {
             server: ServerConfig::default(),
             active_version: VersionId::new("v1"),
             versions: HashMap::new(),
-            watch: WatchConfig::default(),
             drain: DrainConfig::default(),
         }
     }

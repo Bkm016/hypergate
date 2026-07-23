@@ -7,6 +7,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hypergate_core::RequestKind;
+use hypergate_core::{HyperError, HyperResult};
 
 /// Version app HTTP 客户端。
 pub(crate) type VersionClient = Client<HttpConnector, Body>;
@@ -58,5 +59,43 @@ fn connect_timeout_option(timeout: Duration) -> Option<Duration> {
         None
     } else {
         Some(timeout)
+    }
+}
+
+/// 切流前独立执行 version app 健康检查。
+pub(crate) struct HealthChecker {
+    client: VersionClient,
+    timeout: Duration,
+}
+
+impl HealthChecker {
+    /// 创建使用独立连接池的健康检查器。
+    pub(crate) fn new(connect_timeout: Duration, timeout: Duration) -> Self {
+        Self {
+            client: build_client(connect_timeout),
+            timeout,
+        }
+    }
+
+    /// 请求健康地址并要求返回 2xx。
+    pub(crate) async fn check(&self, health: &str) -> HyperResult<()> {
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(health)
+            .body(Body::empty())
+            .map_err(|error| HyperError::new(format!("build health request failed: {error}")))?;
+        let response = tokio::time::timeout(self.timeout, self.client.request(request))
+            .await
+            .map_err(|_| {
+                HyperError::new(format!("health check timed out after {:?}", self.timeout))
+            })?
+            .map_err(|error| HyperError::new(format!("health check request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(HyperError::new(format!(
+                "health check returned {}",
+                response.status()
+            )));
+        }
+        Ok(())
     }
 }

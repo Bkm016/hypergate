@@ -2,6 +2,8 @@
 
 use std::any::Any;
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use hypergate_core::{HyperError, HyperResult};
@@ -10,8 +12,11 @@ mod help;
 
 pub use help::{error_output, exit, help, scoped_help};
 
+/// 命令异步处理结果。
+pub type CommandFuture<'a> = Pin<Box<dyn Future<Output = CommandResult> + Send + 'a>>;
+
 /// 命令处理函数。
-pub type CommandHandler = for<'a> fn(CommandContext<'a>, &[&str]) -> HyperResult<CommandOutput>;
+pub type CommandHandler = for<'a> fn(CommandContext<'a>, &'a [&'a str]) -> CommandFuture<'a>;
 
 /// 命令处理结果。
 pub type CommandResult = HyperResult<CommandOutput>;
@@ -62,7 +67,7 @@ pub struct CommandContext<'a> {
     /// 当前命令注册表。
     pub registry: &'a CommandRegistry,
     /// 调用方注入的业务状态。
-    pub state: &'a dyn Any,
+    pub state: &'a (dyn Any + Send + Sync),
 }
 
 impl<'a> CommandContext<'a> {
@@ -131,22 +136,26 @@ impl CommandRegistry {
     }
 
     /// 执行交互式控制台命令。
-    pub fn execute_console(&self, command: &str, state: &dyn Any) -> HyperResult<CommandOutput> {
-        self.execute(command, state, CommandScope::Console)
+    pub async fn execute_console(
+        &self,
+        command: &str,
+        state: &(dyn Any + Send + Sync),
+    ) -> HyperResult<CommandOutput> {
+        self.execute(command, state, CommandScope::Console).await
     }
 
     /// 解析命令、校验调用范围和参数策略,再交给 handler 执行。
-    fn execute(
-        &self,
+    async fn execute<'a>(
+        &'a self,
         command: &str,
-        state: &dyn Any,
+        state: &'a (dyn Any + Send + Sync),
         scope: CommandScope,
     ) -> HyperResult<CommandOutput> {
         let parts = parse_parts(command)?;
         let entry = self.resolve(&parts, scope)?;
         let args = &parts[entry.path.len()..];
         validate_arguments(entry, args)?;
-        (entry.handler)(command_context(self, state), args)
+        (entry.handler)(command_context(self, state), args).await
     }
 
     /// 根据当前输入返回基础补全候选。
@@ -242,7 +251,10 @@ fn validate_arguments(command: &RegisteredCommand, args: &[&str]) -> HyperResult
 }
 
 /// 构造传给 handler 的轻量上下文。
-fn command_context<'a>(registry: &'a CommandRegistry, state: &'a dyn Any) -> CommandContext<'a> {
+fn command_context<'a>(
+    registry: &'a CommandRegistry,
+    state: &'a (dyn Any + Send + Sync),
+) -> CommandContext<'a> {
     CommandContext { registry, state }
 }
 

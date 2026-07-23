@@ -30,11 +30,21 @@ where
         loader: Arc<dyn ConfigLoader<T>>,
         validator: Arc<dyn ConfigValidator<T>>,
     ) -> Self {
+        Self::with_revision(initial, loader, validator, ConfigRevision::INITIAL)
+    }
+
+    /// 使用外部持久化状态中的修订号创建配置管理器。
+    pub fn with_revision(
+        initial: T,
+        loader: Arc<dyn ConfigLoader<T>>,
+        validator: Arc<dyn ConfigValidator<T>>,
+        revision: ConfigRevision,
+    ) -> Self {
         Self {
             current: ArcSwap::from_pointee(initial),
             loader,
             validator,
-            revision: AtomicU64::new(ConfigRevision::INITIAL.value),
+            revision: AtomicU64::new(revision.value),
         }
     }
 
@@ -82,12 +92,16 @@ where
     /// 直接应用已经构建完成的配置。用于管理指令产生的运行态变更。
     pub fn apply(&self, next: T) -> HyperResult<Arc<T>> {
         self.validator.validate(&next)?;
+        Ok(self.apply_validated(next))
+    }
 
-        // 管理指令产生的配置变更走同一条替换路径,避免绕过校验链。
+    /// 提交调用方已经通过本管理器 validator 校验的配置。
+    /// 该入口用于先持久化外部运行状态、再无失败替换内存快照的控制事务。
+    pub fn apply_validated(&self, next: T) -> Arc<T> {
         let next = Arc::new(next);
         self.current.store(next.clone());
         self.revision.fetch_add(1, Ordering::Relaxed);
-        Ok(next)
+        next
     }
 }
 

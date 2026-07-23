@@ -8,6 +8,10 @@ authors.workspace = true
 [dependencies]
 arc-swap.workspace = true
 hypergate-core = { path = "../hypergate-core" }
+http.workspace = true
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [lints]
 workspace = true

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use hypergate_cli::command::{
-    CommandContext, CommandOutput, CommandRegistry, CompletionKind, CompletionProvider,
-    RegisteredCommand,
+    CommandContext, CommandFuture, CommandOutput, CommandRegistry, CompletionKind,
+    CompletionProvider, RegisteredCommand,
 };
 use hypergate_cli::console::{CommandState, ConsoleOptions, control_loop, spawn_console};
 use hypergate_cli::format::render_panel;
@@ -252,19 +252,21 @@ where
 }
 
 /// 将 `show` 根命令收束到自动生成的子树帮助。
-fn show_help(context: CommandContext<'_>, args: &[&str]) -> HyperResult<CommandOutput> {
-    hypergate_cli::command::scoped_help(context, args, &["show"])
+fn show_help<'a>(context: CommandContext<'a>, args: &'a [&'a str]) -> CommandFuture<'a> {
+    Box::pin(async move { hypergate_cli::command::scoped_help(context, args, &["show"]) })
 }
 
 /// 输出当前 version app 的 SDK 状态快照。
-fn status<T>(context: CommandContext<'_>, _args: &[&str]) -> HyperResult<CommandOutput>
+fn status<'a, T>(context: CommandContext<'a>, _args: &'a [&'a str]) -> CommandFuture<'a>
 where
     T: Send + Sync + 'static,
 {
-    let state = context.state::<VersionAppCommandState<T>>()?;
-    Ok(CommandOutput {
-        summary: format!("app={}", state.options.name),
-        rendered: version_status::<T>(state)?,
+    Box::pin(async move {
+        let state = context.state::<VersionAppCommandState<T>>()?;
+        Ok(CommandOutput {
+            summary: format!("app={}", state.options.name),
+            rendered: version_status::<T>(state)?,
+        })
     })
 }
 

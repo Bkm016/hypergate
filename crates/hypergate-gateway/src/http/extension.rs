@@ -17,6 +17,13 @@ impl RequestKindClassifier for DefaultRequestKindClassifier {
     fn classify(&self, request: &Request) -> RequestKind {
         if request
             .headers()
+            .get(http::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        {
+            return RequestKind::Stream;
+        }
+        if request
+            .headers()
             .get(http::header::ACCEPT)
             .is_some_and(|value| {
                 value

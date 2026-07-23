@@ -1,6 +1,6 @@
 # HyperGate
 
-HyperGate 是一个原生支持多版本部署的网络后端框架底座。它把稳定不变的 gateway 和可独立发布的 version app 分开：gateway 负责接收客户端请求、维护 active version、执行切换和排水；业务代码运行在独立 version app 可执行文件中，并监听自己的端口。
+HyperGate 是一个原生支持多版本流量切换的网络后端框架底座。它把稳定不变的 gateway 和可独立发布的 version app 分开：gateway 负责接收客户端请求、健康门禁、维护 active version、执行切换和排水；业务进程仍由 systemd 或部署器管理。
 
 项目目标是让开发者在不修改框架 crates 的前提下开发业务服务，同时获得本地控制台、多版本切换、配置快照、长连接排水和高性能 HTTP 转发能力。
 
@@ -12,7 +12,7 @@ HyperGate 是一个原生支持多版本部署的网络后端框架底座。它�
 | Version app | `hypergate-version-v1`、`hypergate-version-v2` | 承载业务 HTTP 能力、业务配置、业务控制台指令 | 读取 gateway version id、修改 gateway active version |
 | Shared crates | `hypergate-core`、`hypergate-config`、`hypergate-cli`、`hypergate-app` | 提供通用类型、配置快照、命令系统和 version app SDK | 携带 gateway 专属指令或业务逻辑 |
 
-Gateway 配置中的 `v1`、`v2` 是部署标识，只存在于 gateway 控制面。Version app 不接收 `--version`，也不需要知道自己在 gateway 配置里叫 `v1` 还是 `v2`。
+Gateway 配置中的 `v1`、`v2` 是部署标识，只存在于 gateway 控制面。声明配置来自 TOML，active version、revision 和 rollback history 保存在 Gateway 私有状态文件中。
 
 ## Workspace
 
@@ -39,6 +39,13 @@ start-v2.bat
 
 ```bat
 start-gateway.bat
+```
+
+生产入口显式接收声明配置和私有状态路径：
+
+```text
+hypergate start --config /etc/hypergate/hypergate.toml --state /var/lib/hypergate/state.json
+hypergate check --config /etc/hypergate/hypergate.toml
 ```
 
 访问 gateway：
@@ -91,10 +98,10 @@ client
 
 ```text
 version switch v2
-  -> prepare and validate v2 target
+  -> validate v2 target and request its health URL
   -> v2 becomes active
-  -> gateway active target is atomically replaced
-  -> config snapshot is replaced
+  -> persist active version and rollback history
+  -> gateway active target and config snapshot are atomically replaced
   -> previous active version enters draining
   -> new requests go to v2
   -> old streams keep their original lease
@@ -130,15 +137,18 @@ version switch v2
 
 | 能力 | 状态 |
 |---|---|
-| HTTP 转发 | 已实现 |
+| HTTP / WebSocket 转发 | 已实现 |
 | 多版本切换和回滚 | 已实现 |
 | 长连接租约计数 | 已实现 |
+| TOML 配置和重启恢复 | 已实现 |
+| 切流健康门禁 | 已实现 |
+| 排水超时和强制关闭 | 已实现 |
+| Gateway 优雅关闭 | 已实现 |
 | Gateway 控制台 | 已实现 |
 | Gateway 本机管理 API | 已实现,默认关闭 |
 | Version app 控制台 SDK | 已实现 |
 | 泛型配置快照 | 已实现 |
-| 文件监听 loader | 未实现 |
-| WebSocket 隧道 | 未实现 |
+| 文件自动监听 | 未实现，使用管理 API 或控制台 reload |
 | Runtime metrics | 已实现版本 active/stream/total 基础指标 |
 
 ## Design Constraints
@@ -146,8 +156,14 @@ version switch v2
 | 约束 | 说明 |
 |---|---|
 | 管理 API 仅限本机 | 默认关闭,只允许 loopback 监听并要求 Bearer 鉴权 |
-| 不使用控制文件 | 不保留 `.hypergate/control.*`、`control.json` 等文件控制通道 |
+| 不使用文件控制通道 | 状态文件只由 Gateway 原子写入，不监听文件动作；控制只走本机管理 API 或控制台 |
 | Gateway 不托管业务进程 | 业务进程由部署系统或用户自行启动 |
 | Version app 不知道 gateway version id | 部署标识只存在于 gateway 配置 |
 | 请求热路径不读写配置锁 | Active target 用快照替换 |
 | 框架 crates 保持通用 | 只有 `hypergate-gateway` 可以放 gateway 专属逻辑 |
+
+## Configuration
+
+仓库根目录的 `hypergate.toml` 是完整示例。每个 version 必须声明 `endpoint` 和返回 2xx 的 `health`。`trusted_proxies` 只填写直接连接 Gateway、且会清洗转发头的代理网段；其他来源携带的 `X-Forwarded-*`、`X-Real-IP` 和 `CF-Connecting-IP` 会被丢弃。
+
+Gateway reload 可以增改 version 和 drain 策略，但监听地址、连接超时、可信代理等 server 配置需要重启后生效，因此运行中修改会被拒绝。状态文件损坏或 active version 不再存在时 Gateway 失败关闭，不静默回退默认版本。

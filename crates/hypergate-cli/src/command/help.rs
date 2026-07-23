@@ -2,14 +2,16 @@
 
 use hypergate_core::HyperResult;
 
-use crate::command::{CommandContext, CommandOutput, RegisteredCommand};
+use crate::command::{CommandContext, CommandFuture, CommandOutput, RegisteredCommand};
 use crate::format::render_panel;
 
 /// 输出当前注册表的帮助树。
-pub fn help(context: CommandContext<'_>, args: &[&str]) -> HyperResult<CommandOutput> {
-    Ok(CommandOutput {
-        summary: "console=help".to_owned(),
-        rendered: command_help(context.registry.commands(), args),
+pub fn help<'a>(context: CommandContext<'a>, args: &'a [&'a str]) -> CommandFuture<'a> {
+    Box::pin(async move {
+        Ok(CommandOutput {
+            summary: "console=help".to_owned(),
+            rendered: command_help(context.registry.commands(), args),
+        })
     })
 }
 
@@ -26,17 +28,19 @@ pub fn scoped_help(
 }
 
 /// 输出退出提示。
-pub fn exit(_context: CommandContext<'_>, _args: &[&str]) -> HyperResult<CommandOutput> {
-    Ok(CommandOutput {
-        summary: "console=quit".to_owned(),
-        rendered: render_panel(
-            "Console",
-            vec![(
-                "message".to_owned(),
-                "press Ctrl+C to stop this process".to_owned(),
-            )],
-            Vec::new(),
-        ),
+pub fn exit<'a>(_context: CommandContext<'a>, _args: &'a [&'a str]) -> CommandFuture<'a> {
+    Box::pin(async move {
+        Ok(CommandOutput {
+            summary: "console=quit".to_owned(),
+            rendered: render_panel(
+                "Console",
+                vec![(
+                    "message".to_owned(),
+                    "press Ctrl+C to stop this process".to_owned(),
+                )],
+                Vec::new(),
+            ),
+        })
     })
 }
 

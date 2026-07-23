@@ -129,14 +129,36 @@ impl ConfigValidator<RuntimeConfig> for DefaultConfigValidator {
         if !config.versions.contains_key(&config.active_version) {
             return Err(HyperError::new("active version is not configured"));
         }
+        if config.server.version_health_timeout.is_zero() {
+            return Err(HyperError::new(
+                "version health timeout must be greater than zero",
+            ));
+        }
+        if config.server.shutdown_timeout.is_zero() {
+            return Err(HyperError::new(
+                "shutdown timeout must be greater than zero",
+            ));
+        }
         for (id, version) in &config.versions {
-            if id.value.is_empty() {
+            if id.value.trim().is_empty() {
                 return Err(HyperError::new("version id is empty"));
             }
-            if version.endpoint.is_empty() {
-                return Err(HyperError::new("version endpoint is empty"));
-            }
+            validate_http_uri("version endpoint", &version.endpoint)?;
+            validate_http_uri("version health", &version.health)?;
         }
         Ok(())
     }
+}
+
+/// Version app 当前只允许本机明文 HTTP，TLS 终止应位于稳定网关外层。
+fn validate_http_uri(label: &str, value: &str) -> HyperResult<()> {
+    let uri = value
+        .parse::<http::Uri>()
+        .map_err(|error| HyperError::new(format!("invalid {label}: {error}")))?;
+    if uri.scheme_str() != Some("http") || uri.authority().is_none() {
+        return Err(HyperError::new(format!(
+            "{label} must be an absolute http URI"
+        )));
+    }
+    Ok(())
 }

@@ -1,5 +1,6 @@
 /target/
 /.hypergate/
+/hypergate.state.json
 /.idea/
 /.cargo/config.toml
 

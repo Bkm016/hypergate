@@ -3,13 +3,13 @@
 #![deny(missing_docs)]
 
 mod extension;
+mod file;
 mod manager;
 mod schema;
 
 pub use extension::{
     ConfigLoader, ConfigValidator, ConfigValidatorChain, DefaultConfigValidator, StaticConfigLoader,
 };
+pub use file::TomlConfigLoader;
 pub use manager::ConfigManager;
-pub use schema::{
-    DrainConfig, ReloadTrigger, RuntimeConfig, ServerConfig, VersionConfig, WatchConfig,
-};
+pub use schema::{DrainConfig, ReloadTrigger, RuntimeConfig, ServerConfig, VersionConfig};

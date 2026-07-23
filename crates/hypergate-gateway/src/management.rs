@@ -10,6 +10,7 @@
 //! - `POST /api/v1/actions/drain`: 让非 active 版本进入 draining。
 //! - `POST /api/v1/actions/stop`: 在连接清空后停止非 active 版本。
 //! - `POST /api/v1/actions/rollback`: 切回上一个 active version。
+//! - `POST /api/v1/actions/reload`: 重读并应用 TOML 配置。
 //!
 //! 所有路由要求 `Authorization: Bearer <token>` 鉴权,使用常时比较。
 //! 不配置 CORS。错误响应为稳定 JSON,缺失/非法鉴权返回 401,
@@ -28,6 +29,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use hypergate_core::{HyperError, HyperResult, VersionId};
+use tokio_util::sync::CancellationToken;
 
 use crate::control::{ControlError, ControlOutcome, GatewayControl};
 
@@ -162,6 +164,7 @@ pub(crate) fn router(state: ManagementState) -> axum::Router {
         .route("/api/v1/actions/drain", post(drain))
         .route("/api/v1/actions/stop", post(stop))
         .route("/api/v1/actions/rollback", post(rollback))
+        .route("/api/v1/actions/reload", post(reload))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(
@@ -172,12 +175,17 @@ pub(crate) fn router(state: ManagementState) -> axum::Router {
 }
 
 /// 启动管理 HTTP 服务,监听到配置地址。返回时表示监听失败。
-pub(crate) async fn serve(state: ManagementState, listen: SocketAddr) -> HyperResult<()> {
+pub(crate) async fn serve(
+    state: ManagementState,
+    listen: SocketAddr,
+    shutdown: CancellationToken,
+) -> HyperResult<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| HyperError::new(format!("admin bind failed: {e}")))?;
     let router = router(state);
     axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
         .map_err(|e| HyperError::new(format!("admin serve failed: {e}")))
 }
@@ -231,6 +239,7 @@ async fn switch(
     match state
         .control
         .switch(version, Some(request.expected_revision))
+        .await
     {
         Ok(outcome) => outcome_response(outcome),
         Err(error) => control_error(error),
@@ -286,10 +295,10 @@ async fn stop(
     }
 }
 
-/// 回滚请求体。
+/// 仅包含乐观锁修订号的动作请求体。
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RollbackRequest {
+struct RevisionActionRequest {
     /// 期望配置修订号。
     expected_revision: u64,
 }
@@ -297,13 +306,32 @@ struct RollbackRequest {
 /// `POST /api/v1/actions/rollback`。切回上一个 active version。
 async fn rollback(
     State(state): State<ManagementState>,
-    body: Result<Json<RollbackRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<RevisionActionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(request) = match body {
         Ok(value) => value,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid request body"),
     };
-    match state.control.rollback(Some(request.expected_revision)) {
+    match state
+        .control
+        .rollback(Some(request.expected_revision))
+        .await
+    {
+        Ok(outcome) => outcome_response(outcome),
+        Err(error) => control_error(error),
+    }
+}
+
+/// `POST /api/v1/actions/reload`。重读配置并保留持久化 active version。
+async fn reload(
+    State(state): State<ManagementState>,
+    body: Result<Json<RevisionActionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(value) => value,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid request body"),
+    };
+    match state.control.reload(Some(request.expected_revision)).await {
         Ok(outcome) => outcome_response(outcome),
         Err(error) => control_error(error),
     }

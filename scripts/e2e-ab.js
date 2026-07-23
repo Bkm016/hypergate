@@ -12,6 +12,7 @@
 const { spawn, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
@@ -23,12 +24,14 @@ const v1Exe = path.join(targetDir, `hypergate-version-v1${exeSuffix}`);
 const v2Exe = path.join(targetDir, `hypergate-version-v2${exeSuffix}`);
 const children = [];
 const events = [];
+const stateFile = path.join(os.tmpdir(), `hypergate-e2e-${process.pid}.state.json`);
 
 main().catch((error) => {
   console.error(error.stack || String(error));
   process.exitCode = 1;
 }).finally(async () => {
   await stopChildren();
+  fs.rmSync(stateFile, { force: true });
 });
 
 async function main() {
@@ -59,7 +62,13 @@ async function main() {
   pass("http", `v2 direct response: ${directV2}`);
 
   step("spawn", `start ${path.basename(gatewayExe)}`);
-  const gateway = spawnManaged(gatewayExe, []);
+  const gateway = spawnManaged(gatewayExe, [
+    "start",
+    "--config",
+    path.join(root, "hypergate.toml"),
+    "--state",
+    stateFile,
+  ]);
   pass("spawn", `${path.basename(gatewayExe)} pid=${gateway.pid}`);
 
   step("http", "GET http://127.0.0.1:8080/ before switch");

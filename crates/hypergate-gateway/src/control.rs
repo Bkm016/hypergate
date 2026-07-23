@@ -11,15 +11,19 @@
 //!
 //! 本模块不实现健康检查,业务语义与原 lifecycle 指令保持一致。
 
+use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hypergate_config::{ConfigManager, RuntimeConfig};
-use hypergate_core::{HyperError, HyperResult, VersionId};
+use hypergate_config::{ConfigManager, DrainConfig, RuntimeConfig};
+use hypergate_core::{ConfigRevision, HyperError, HyperResult, VersionId};
 
-use crate::http::Gateway;
-use crate::runtime::VersionRegistry;
+use crate::http::{Gateway, HealthChecker};
+use crate::runtime::{VersionRegistry, VersionRuntime};
+use crate::state::{PersistedState, StateStore};
 
 /// Gateway 生命周期控制入口。
 pub(crate) struct GatewayControl {
@@ -29,6 +33,10 @@ pub(crate) struct GatewayControl {
     gateway: Arc<Gateway>,
     /// 版本运行态注册表。
     versions: Arc<VersionRegistry>,
+    /// active version 与回滚历史持久化存储。
+    state_store: Arc<StateStore>,
+    /// 切流前 version app 健康检查实现。
+    health_checker: Arc<dyn VersionHealthChecker>,
     /// 串行化控制动作并维护回滚历史。
     state: Mutex<ControlState>,
     /// 控制器创建时间,用于计算 uptime。
@@ -45,6 +53,7 @@ struct ControlState {
 }
 
 /// 控制动作失败类型,区分运行态冲突和内部故障。
+#[derive(Debug)]
 pub(crate) enum ControlError {
     /// 当前状态拒绝操作,客户端应刷新状态后重新决策。
     Conflict(String),
@@ -78,14 +87,35 @@ impl GatewayControl {
         manager: Arc<ConfigManager<RuntimeConfig>>,
         gateway: Arc<Gateway>,
         versions: Arc<VersionRegistry>,
+        state_store: Arc<StateStore>,
+        history: Vec<VersionId>,
+    ) -> Self {
+        Self::with_health_checker(
+            manager,
+            gateway,
+            versions,
+            state_store,
+            history,
+            Arc::new(HttpVersionHealthChecker),
+        )
+    }
+
+    /// 使用指定健康检查实现创建生命周期控制入口。
+    fn with_health_checker(
+        manager: Arc<ConfigManager<RuntimeConfig>>,
+        gateway: Arc<Gateway>,
+        versions: Arc<VersionRegistry>,
+        state_store: Arc<StateStore>,
+        history: Vec<VersionId>,
+        health_checker: Arc<dyn VersionHealthChecker>,
     ) -> Self {
         Self {
             manager,
             gateway,
             versions,
-            state: Mutex::new(ControlState {
-                history: Vec::new(),
-            }),
+            state_store,
+            health_checker,
+            state: Mutex::new(ControlState { history }),
             started_at: Instant::now(),
         }
     }
@@ -112,17 +142,51 @@ impl GatewayControl {
     ///
     /// 当 `expected` 与当前配置修订号不匹配时返回错误。
     /// 切换成功后返回形如 `active=<version>` 的摘要文本。
-    pub(crate) fn switch(
+    pub(crate) async fn switch(
         &self,
         next_version: VersionId,
         expected: Option<u64>,
     ) -> ControlResult<ControlOutcome> {
+        self.switch_with_health(next_version, expected, true).await
+    }
+
+    /// 健康检查目标版本后提交切换，探活期间发生其他控制动作则拒绝旧提交。
+    async fn switch_with_health(
+        &self,
+        next_version: VersionId,
+        expected: Option<u64>,
+        push_history: bool,
+    ) -> ControlResult<ControlOutcome> {
+        self.check_expected(expected)?;
+        let observed = self.manager.revision().value;
+        let config = self.manager.snapshot();
+        if config.active_version != next_version {
+            let version = config
+                .versions
+                .get(&next_version)
+                .ok_or_else(|| ControlError::Conflict("version is not configured".to_owned()))?;
+            self.health_checker
+                .check(
+                    &version.health,
+                    config.server.version_connect_timeout,
+                    config.server.version_health_timeout,
+                )
+                .await
+                .map_err(|error| {
+                    ControlError::Conflict(format!("version health check failed: {error}"))
+                })?;
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
-        self.check_expected(expected)?;
-        let summary = self.switch_active(&mut state, next_version, true)?;
+        self.check_expected(Some(observed))?;
+        if !push_history && state.history.last() != Some(&next_version) {
+            return Err(ControlError::Conflict(
+                "rollback target changed during health check".to_owned(),
+            ));
+        }
+        let summary = self.switch_active(&mut state, next_version, push_history)?;
         Ok(self.outcome(&state, summary))
     }
 
@@ -151,7 +215,7 @@ impl GatewayControl {
             .get(&version)
             .map_err(ControlError::Internal)?
             .ok_or_else(|| ControlError::Conflict("version not found".to_owned()))?;
-        runtime.drain();
+        self.begin_drain(runtime, &config.drain);
         Ok(self.outcome(&state, format!("draining={}", version.value)))
     }
 
@@ -191,38 +255,89 @@ impl GatewayControl {
     /// 当 `expected` 与当前配置修订号不匹配时返回错误。
     /// 成功后返回形如 `active=<version>` 的摘要文本。
     /// 边界:回滚按 LIFO 语义消费历史栈顶,消费后弹出该条目;历史本身由 switch 维持有界。
-    pub(crate) fn rollback(&self, expected: Option<u64>) -> ControlResult<ControlOutcome> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
+    pub(crate) async fn rollback(&self, expected: Option<u64>) -> ControlResult<ControlOutcome> {
         self.check_expected(expected)?;
-        let previous = state
-            .history
-            .last()
-            .cloned()
-            .ok_or_else(|| ControlError::Conflict("rollback history is empty".to_owned()))?;
-        let summary = self.switch_active(&mut state, previous, false)?;
-        state.history.pop();
-        Ok(self.outcome(&state, summary))
+        let previous = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
+            state
+                .history
+                .last()
+                .cloned()
+                .ok_or_else(|| ControlError::Conflict("rollback history is empty".to_owned()))?
+        };
+        self.switch_with_health(previous, expected, false).await
     }
 
     /// 重新加载配置快照并同步 gateway 热路径状态。
     ///
     /// 成功后返回 `reload=ok`。
-    pub(crate) fn reload(&self) -> ControlResult<ControlOutcome> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
+    pub(crate) async fn reload(&self, expected: Option<u64>) -> ControlResult<ControlOutcome> {
+        self.check_expected(expected)?;
+        let observed = self.manager.revision().value;
         let old = self.manager.snapshot();
-        let mut next = old.as_ref().clone();
-        next.revision = next.revision.next();
+        let next_revision = self.manager.revision().next();
+        let mut next = self
+            .manager
+            .loader
+            .load(next_revision)
+            .map_err(ControlError::Internal)?;
+        if next.server != old.server {
+            return Err(ControlError::Conflict(
+                "server configuration changes require a gateway restart".to_owned(),
+            ));
+        }
+        next.active_version = old.active_version.clone();
+        for version_id in next.versions.keys() {
+            self.versions
+                .ensure(version_id.clone())
+                .map_err(ControlError::Internal)?;
+        }
         let prepared = self
             .gateway
             .prepare_active(&next)
             .map_err(ControlError::Internal)?;
-        self.manager.apply(next).map_err(ControlError::Internal)?;
+        self.manager
+            .validator
+            .validate(&next)
+            .map_err(ControlError::Internal)?;
+        let active = next
+            .versions
+            .get(&next.active_version)
+            .ok_or_else(|| ControlError::Conflict("active version is not configured".to_owned()))?;
+        self.health_checker
+            .check(
+                &active.health,
+                next.server.version_connect_timeout,
+                next.server.version_health_timeout,
+            )
+            .await
+            .map_err(|error| {
+                ControlError::Conflict(format!("active version health check failed: {error}"))
+            })?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
+        self.check_expected(Some(observed))?;
+        for snapshot in self.versions.snapshots().map_err(ControlError::Internal)? {
+            if snapshot.state != hypergate_core::VersionState::Stopped
+                && !next.versions.contains_key(&snapshot.id)
+            {
+                return Err(ControlError::Conflict(format!(
+                    "running version cannot be removed: {}",
+                    snapshot.id.value
+                )));
+            }
+        }
+        let configured = next.versions.keys().cloned().collect::<HashSet<_>>();
+        self.versions
+            .retain_configured(&configured)
+            .map_err(ControlError::Internal)?;
+        self.persist_state(next.revision, &next.active_version, &state.history)?;
+        self.manager.apply_validated(next);
         self.gateway.swap_active(prepared);
         Ok(self.outcome(&state, "reload=ok".to_owned()))
     }
@@ -243,6 +358,15 @@ impl GatewayControl {
         if old.active_version == next_version {
             return Ok(format!("active={}", old.active_version.value));
         }
+        let mut next_history = state.history.clone();
+        if push_history {
+            if next_history.len() >= ROLLBACK_HISTORY_LIMIT {
+                next_history.remove(0);
+            }
+            next_history.push(old.active_version.clone());
+        } else {
+            next_history.pop();
+        }
         let mut next = old.as_ref().clone();
         next.revision = next.revision.next();
         next.active_version = next_version.clone();
@@ -262,26 +386,43 @@ impl GatewayControl {
             .validator
             .validate(&next)
             .map_err(ControlError::Internal)?;
+        self.persist_state(next.revision, &next.active_version, &next_history)?;
         next_runtime.activate();
         // 新版本激活后原子替换热路径,旧版本此时仍可承接已读取旧快照的请求。
-        let previous_target = self.gateway.swap_active(prepared);
-        let applied = match self.manager.apply(next) {
-            Ok(applied) => applied,
-            Err(error) => {
-                self.gateway.swap_active(previous_target);
-                next_runtime.drain();
-                return Err(ControlError::Internal(error));
-            }
-        };
-        old_runtime.drain();
-        if push_history {
-            // 边界:历史固定最多 32 项,溢出时淘汰最旧项,保证 rollback 仍按 LIFO 回到最近 32 次切换之一。
-            if state.history.len() >= ROLLBACK_HISTORY_LIMIT {
-                state.history.remove(0);
-            }
-            state.history.push(old.active_version.clone());
-        }
+        self.gateway.swap_active(prepared);
+        let applied = self.manager.apply_validated(next);
+        self.begin_drain(old_runtime, &applied.drain);
+        state.history = next_history;
         Ok(format!("active={}", applied.active_version.value))
+    }
+
+    /// 进入 draining，并按配置在超时后取消该激活周期的残留连接。
+    fn begin_drain(&self, runtime: Arc<VersionRuntime>, config: &DrainConfig) {
+        runtime.drain();
+        if !config.force_close_streams {
+            return;
+        }
+        let timeout = config.timeout;
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            runtime.force_close_if_draining();
+        });
+    }
+
+    /// 在切流前持久化下一状态，进程崩溃重启后继续指向已提交版本。
+    fn persist_state(
+        &self,
+        revision: ConfigRevision,
+        active_version: &VersionId,
+        history: &[VersionId],
+    ) -> ControlResult<()> {
+        self.state_store
+            .save(&PersistedState {
+                revision,
+                active_version: active_version.clone(),
+                history: history.to_vec(),
+            })
+            .map_err(ControlError::Internal)
     }
 
     /// 生成可 serde 序列化的状态快照 DTO。
@@ -317,11 +458,14 @@ impl GatewayControl {
                     id: snapshot.id.value.to_string(),
                     state: snapshot.state.as_str().to_owned(),
                     endpoint: version.map(|version| version.endpoint.clone()),
-                    health: version.and_then(|version| version.health.clone()),
+                    health: version.map(|version| version.health.clone()),
                     active_requests: snapshot.active_requests,
                     active_streams: snapshot.active_streams,
                     total_requests: snapshot.total_requests,
                     drain_elapsed_seconds: snapshot.drain_elapsed_secs,
+                    drain_timed_out: snapshot
+                        .drain_elapsed_secs
+                        .is_some_and(|elapsed| elapsed >= config.drain.timeout.as_secs()),
                 }
             })
             .collect();
@@ -333,6 +477,35 @@ impl GatewayControl {
             rollback_available,
             uptime_seconds: self.started_at.elapsed().as_secs(),
             versions,
+        })
+    }
+}
+
+/// 切流健康检查扩展边界。
+trait VersionHealthChecker: Send + Sync {
+    /// 检查目标地址是否可接收流量。
+    fn check<'a>(
+        &'a self,
+        health: &'a str,
+        connect_timeout: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = HyperResult<()>> + Send + 'a>>;
+}
+
+/// 基于 Gateway HTTP client 的生产健康检查。
+struct HttpVersionHealthChecker;
+
+impl VersionHealthChecker for HttpVersionHealthChecker {
+    fn check<'a>(
+        &'a self,
+        health: &'a str,
+        connect_timeout: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = HyperResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            HealthChecker::new(connect_timeout, timeout)
+                .check(health)
+                .await
         })
     }
 }
@@ -383,9 +556,12 @@ pub(crate) struct VersionSnapshotDto {
     total_requests: u64,
     /// draining 已持续秒数,未进入 draining 时为 null。
     drain_elapsed_seconds: Option<u64>,
+    /// draining 是否已超过配置上限。
+    drain_timed_out: bool,
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     //! 控制器边界行为测试。验证 rollback history 在固定上限内淘汰最旧项,
     //! 且 rollback 保持 LIFO 语义。
@@ -395,9 +571,43 @@ mod tests {
         ConfigValidatorChain, DefaultConfigValidator, StaticConfigLoader, VersionConfig,
     };
 
+    struct AlwaysHealthy;
+
+    impl VersionHealthChecker for AlwaysHealthy {
+        fn check<'a>(
+            &'a self,
+            _health: &'a str,
+            _connect_timeout: std::time::Duration,
+            _timeout: std::time::Duration,
+        ) -> Pin<Box<dyn Future<Output = HyperResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct NeverHealthy;
+
+    impl VersionHealthChecker for NeverHealthy {
+        fn check<'a>(
+            &'a self,
+            _health: &'a str,
+            _connect_timeout: std::time::Duration,
+            _timeout: std::time::Duration,
+        ) -> Pin<Box<dyn Future<Output = HyperResult<()>> + Send + 'a>> {
+            Box::pin(async { Err(HyperError::new("not ready")) })
+        }
+    }
+
     /// 构造一个最小可运行的 GatewayControl,包含 `count` 个版本,
     /// 初始 active 版本为 v0。
     fn build_control(count: usize) -> Arc<GatewayControl> {
+        build_control_with_health(count, Arc::new(AlwaysHealthy))
+    }
+
+    /// 使用指定健康检查结果构造控制器。
+    fn build_control_with_health(
+        count: usize,
+        health_checker: Arc<dyn VersionHealthChecker>,
+    ) -> Arc<GatewayControl> {
         let mut config = RuntimeConfig::minimal();
         config.active_version = VersionId::new("v0");
         for index in 0..count {
@@ -406,7 +616,7 @@ mod tests {
                 id,
                 VersionConfig {
                     endpoint: format!("http://127.0.0.1:{}", 9000 + index),
-                    health: None,
+                    health: "http://127.0.0.1/health".to_owned(),
                 },
             );
         }
@@ -428,21 +638,42 @@ mod tests {
             .expect("active version lookup")
             .expect("active version should exist")
             .activate();
-        let gateway = Arc::new(
-            Gateway::new(&config, versions.clone()).expect("gateway should build"),
-        );
-        Arc::new(GatewayControl::new(manager, gateway, versions))
+        let gateway =
+            Arc::new(Gateway::new(&config, versions.clone()).expect("gateway should build"));
+        let state_file = tempfile::NamedTempFile::new().expect("state temp file");
+        let state_path = state_file.path().to_path_buf();
+        drop(state_file);
+        Arc::new(GatewayControl::with_health_checker(
+            manager,
+            gateway,
+            versions,
+            Arc::new(StateStore::new(state_path)),
+            Vec::new(),
+            health_checker,
+        ))
+    }
+
+    /// 健康检查失败时不能修改 active version、revision 或回滚历史。
+    #[tokio::test]
+    async fn unhealthy_version_never_receives_traffic() {
+        let control = build_control_with_health(2, Arc::new(NeverHealthy));
+        assert!(control.switch(VersionId::new("v1"), Some(1)).await.is_err());
+        let snapshot = control.snapshot().expect("snapshot should succeed");
+        assert_eq!(snapshot.active_version, "v0");
+        assert_eq!(snapshot.revision, 1);
+        assert!(!snapshot.rollback_available);
     }
 
     /// 验证 switch 记录历史并在超过 32 项上限时淘汰最旧项。
-    #[test]
-    fn switch_evicts_oldest_history_beyond_limit() {
+    #[tokio::test]
+    async fn switch_evicts_oldest_history_beyond_limit() {
         let control = build_control(ROLLBACK_HISTORY_LIMIT + 2);
         // 依次切换到 v1..v33,每次都会把当前 active 版本压入历史。
         for index in 1..=ROLLBACK_HISTORY_LIMIT + 1 {
             let target = VersionId::new(format!("v{index}"));
             let outcome = control
                 .switch(target, None)
+                .await
                 .expect("switch should succeed");
             assert!(
                 outcome.summary.starts_with("active=v"),
@@ -461,7 +692,10 @@ mod tests {
         // ...
         // v32 -> switch v33: history=[v0,...,v32] (33 项,淘汰 v0 -> [v1,...,v32] 32 项)
         // 因此回滚第一次应回到 v32。
-        let outcome = control.rollback(None).expect("rollback should succeed");
+        let outcome = control
+            .rollback(None)
+            .await
+            .expect("rollback should succeed");
         assert!(
             outcome.summary.contains("active=v32"),
             "first rollback should restore v32: {}",
@@ -470,11 +704,11 @@ mod tests {
     }
 
     /// 验证 rollback 在历史为空时返回 Conflict 错误。
-    #[test]
-    fn rollback_empty_history_returns_conflict() {
+    #[tokio::test]
+    async fn rollback_empty_history_returns_conflict() {
         let control = build_control(2);
         // 初始状态下历史为空,回滚应失败。
-        let result = control.rollback(None);
+        let result = control.rollback(None).await;
         assert!(result.is_err(), "rollback on empty history should fail");
         let snapshot = control.snapshot().expect("snapshot should succeed");
         assert!(
@@ -484,26 +718,28 @@ mod tests {
     }
 
     /// 验证 switch 后 rollback 按 LIFO 回到上一个 active 版本。
-    #[test]
-    fn rollback_restores_previous_active_via_lifo() {
+    #[tokio::test]
+    async fn rollback_restores_previous_active_via_lifo() {
         let control = build_control(3);
         // v0 -> switch v1: history=[v0]
         control
             .switch(VersionId::new("v1"), None)
+            .await
             .expect("switch to v1");
         // v1 -> switch v2: history=[v0,v1]
         control
             .switch(VersionId::new("v2"), None)
+            .await
             .expect("switch to v2");
         // rollback(LIFO): 回到 v1,history=[v0]
-        let outcome = control.rollback(None).expect("rollback to v1");
+        let outcome = control.rollback(None).await.expect("rollback to v1");
         assert!(
             outcome.summary.contains("active=v1"),
             "first rollback should restore v1: {}",
             outcome.summary
         );
         // rollback(LIFO): 回到 v0,history=[]
-        let outcome = control.rollback(None).expect("rollback to v0");
+        let outcome = control.rollback(None).await.expect("rollback to v0");
         assert!(
             outcome.summary.contains("active=v0"),
             "second rollback should restore v0: {}",
@@ -511,7 +747,7 @@ mod tests {
         );
         // 历史已空,再次回滚应失败。
         assert!(
-            control.rollback(None).is_err(),
+            control.rollback(None).await.is_err(),
             "rollback after exhausting history should fail"
         );
     }

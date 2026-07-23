@@ -237,6 +237,7 @@ pub async fn control_loop(
         while let Ok(input) = console_rx.try_recv() {
             let output = registry
                 .execute_console(&input.command, state.as_ref())
+                .await
                 .unwrap_or_else(|error| error_output(&error.to_string()));
             println!("{}", colorize_output(&output.rendered));
             let _ = input.completed.send(());

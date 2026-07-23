@@ -1,7 +1,8 @@
 //! Gateway 默认指令注册。
 
 use hypergate_cli::command::{
-    CommandContext, CommandOutput, CompletionKind, CompletionProvider, RegisteredCommand,
+    CommandContext, CommandFuture, CommandOutput, CompletionKind, CompletionProvider,
+    RegisteredCommand,
 };
 use hypergate_cli::hypergate_commands;
 use hypergate_config::{ConfigManager, RuntimeConfig};
@@ -68,13 +69,13 @@ pub(crate) const COMMANDS: &[RegisteredCommand] = hypergate_commands![
 ];
 
 /// 将 `show` 根命令收束到自动生成的子树帮助。
-fn show_help(context: CommandContext<'_>, args: &[&str]) -> HyperResult<CommandOutput> {
-    hypergate_cli::command::scoped_help(context, args, &["show"])
+fn show_help<'a>(context: CommandContext<'a>, args: &'a [&'a str]) -> CommandFuture<'a> {
+    Box::pin(async move { hypergate_cli::command::scoped_help(context, args, &["show"]) })
 }
 
 /// 将 `version` 根命令收束到自动生成的子树帮助。
-fn version_help(context: CommandContext<'_>, args: &[&str]) -> HyperResult<CommandOutput> {
-    hypergate_cli::command::scoped_help(context, args, &["version"])
+fn version_help<'a>(context: CommandContext<'a>, args: &'a [&'a str]) -> CommandFuture<'a> {
+    Box::pin(async move { hypergate_cli::command::scoped_help(context, args, &["version"]) })
 }
 
 /// 控制类命令执行成功后刷新状态视图。

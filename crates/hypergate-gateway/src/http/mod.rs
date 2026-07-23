@@ -10,7 +10,7 @@ mod proxy;
 mod stream;
 
 pub(crate) use body::ProxyBodyPolicy;
-pub(crate) use client::VersionClients;
+pub(crate) use client::{HealthChecker, VersionClients};
 pub(crate) use extension::{DefaultRequestKindClassifier, RequestKindClassifier};
 pub(crate) use gateway::{Gateway, HttpState};
 pub(crate) use proxy::serve;

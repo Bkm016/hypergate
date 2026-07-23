@@ -49,11 +49,6 @@ pub(crate) fn format_config(config: &RuntimeConfig) -> String {
             ("listen".to_owned(), config.server.listen.to_string()),
             ("active".to_owned(), config.active_version.value.to_string()),
             ("revision".to_owned(), config.revision.value.to_string()),
-            ("watch".to_owned(), config.watch.enabled.to_string()),
-            (
-                "debounce".to_owned(),
-                format!("{}ms", config.watch.debounce.as_millis()),
-            ),
             (
                 "drain_timeout".to_owned(),
                 format!("{}s", config.drain.timeout.as_secs()),
@@ -92,7 +87,13 @@ pub(crate) fn versions_table(
                 .get(&VersionId::new(snapshot.id.value.clone()));
             let drain_elapsed = snapshot
                 .drain_elapsed_secs
-                .map(|value| format!("{value}s"))
+                .map(|value| {
+                    if value >= config.drain.timeout.as_secs() {
+                        format!("{value}s timeout")
+                    } else {
+                        format!("{value}s")
+                    }
+                })
                 .unwrap_or_else(|| "-".to_owned());
             vec![
                 snapshot.id.value.to_string(),
@@ -101,7 +102,7 @@ pub(crate) fn versions_table(
                     .map(|version| version.endpoint.clone())
                     .unwrap_or_else(|| "-".to_owned()),
                 version
-                    .and_then(|version| version.health.clone())
+                    .map(|version| version.health.clone())
                     .unwrap_or_else(|| "-".to_owned()),
                 snapshot.active_requests.to_string(),
                 snapshot.active_streams.to_string(),
@@ -172,7 +173,7 @@ pub(crate) fn version_endpoints_table(config: &RuntimeConfig) -> Table {
             vec![
                 id.value.to_string(),
                 version.endpoint.clone(),
-                version.health.clone().unwrap_or_else(|| "-".to_owned()),
+                version.health.clone(),
             ]
         })
         .collect();

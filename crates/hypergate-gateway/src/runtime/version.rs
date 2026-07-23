@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use hypergate_core::{HyperError, HyperResult, RequestKind, VersionId, VersionState};
+use tokio_util::sync::CancellationToken;
 
 use super::VersionLease;
 
@@ -27,6 +28,8 @@ pub(crate) struct VersionRuntime {
     pub(crate) total_requests: AtomicU64,
     /// 进入 draining 的时间。
     pub(crate) drain_started_at: RwLock<Option<Instant>>,
+    /// 当前激活周期的强制排水取消令牌。
+    cancel: RwLock<CancellationToken>,
 }
 
 impl VersionRuntime {
@@ -38,6 +41,7 @@ impl VersionRuntime {
             active_streams: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
             drain_started_at: RwLock::new(None),
+            cancel: RwLock::new(CancellationToken::new()),
         }
     }
 
@@ -69,6 +73,7 @@ impl VersionRuntime {
         Ok(VersionLease {
             version: self.clone(),
             kind,
+            cancel: self.cancel_token(),
         })
     }
 
@@ -79,6 +84,13 @@ impl VersionRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         *drain_started_at = None;
+        let mut cancel = match self.cancel.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cancel.is_cancelled() {
+            *cancel = CancellationToken::new();
+        }
         self.set_state(VersionState::Active);
     }
 
@@ -126,6 +138,27 @@ impl VersionRuntime {
         }
         self.state_and_requests
             .fetch_sub(REQUEST_INCREMENT, Ordering::AcqRel);
+    }
+
+    /// 把已创建的普通请求计入活跃流式连接。
+    pub(crate) fn promote_stream(&self) {
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 在版本仍处于 draining 时强制取消当前激活周期的残留请求。
+    pub(crate) fn force_close_if_draining(&self) {
+        if unpack_state(self.state_and_requests.load(Ordering::Acquire)) != VersionState::Draining {
+            return;
+        }
+        self.cancel_token().cancel();
+    }
+
+    /// 克隆当前激活周期的取消令牌。
+    fn cancel_token(&self) -> CancellationToken {
+        match self.cancel.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// 读取版本状态快照。
@@ -216,4 +249,44 @@ pub(crate) struct VersionSnapshot {
     pub(crate) total_requests: u64,
     /// draining 已持续秒数。
     pub(crate) drain_elapsed_secs: Option<u64>,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Draining 必须原子拒绝新请求，同时允许既有租约自然释放。
+    #[test]
+    fn draining_rejects_new_leases_and_preserves_existing_lease() {
+        let runtime = Arc::new(VersionRuntime::new(VersionId::new("blue")));
+        runtime.activate();
+        let lease = runtime
+            .lease(RequestKind::Unary)
+            .expect("active version should lease");
+        runtime.drain();
+        assert!(runtime.lease(RequestKind::Unary).is_err());
+        assert_eq!(runtime.snapshot().active_requests, 1);
+        drop(lease);
+        assert_eq!(runtime.snapshot().active_requests, 0);
+        runtime.stop_idle().expect("idle version should stop");
+    }
+
+    /// 强制排水只取消当前 draining 激活周期，重新激活后使用新令牌。
+    #[test]
+    fn forced_drain_cancels_old_cycle_only() {
+        let runtime = Arc::new(VersionRuntime::new(VersionId::new("blue")));
+        runtime.activate();
+        let old = runtime
+            .lease(RequestKind::Stream)
+            .expect("active version should lease");
+        runtime.drain();
+        runtime.force_close_if_draining();
+        assert!(old.cancel_token().is_cancelled());
+        runtime.activate();
+        let next = runtime
+            .lease(RequestKind::Stream)
+            .expect("reactivated version should lease");
+        assert!(!next.cancel_token().is_cancelled());
+    }
 }

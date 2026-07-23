@@ -1,9 +1,9 @@
 //! 多版本注册表和请求租约分配。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use hypergate_core::{HyperError, HyperResult, VersionId};
+use hypergate_core::{HyperError, HyperResult, VersionId, VersionState};
 
 use super::{VersionRuntime, VersionSnapshot};
 
@@ -55,6 +55,18 @@ impl VersionRegistry {
         }
         snapshots.sort_by(|a, b| a.id.value.cmp(&b.id.value));
         Ok(snapshots)
+    }
+
+    /// 删除配置中已不存在且没有连接的 stopped 运行态，避免版本记录无限增长。
+    pub(crate) fn retain_configured(&self, configured: &HashSet<VersionId>) -> HyperResult<()> {
+        let mut versions = self
+            .versions
+            .write()
+            .map_err(|_| HyperError::new("version registry lock poisoned"))?;
+        versions.retain(|id, runtime| {
+            configured.contains(id) || runtime.snapshot().state != VersionState::Stopped
+        });
+        Ok(())
     }
 }
 
