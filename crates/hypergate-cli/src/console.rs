@@ -162,6 +162,9 @@ impl Highlighter for ConsoleHelper {
 
 impl Validator for ConsoleHelper {}
 
+/// 交互式命令历史固定上限,使用 rustyline Config API 限制历史条数而非自行包装。
+const INTERACTIVE_HISTORY_LIMIT: usize = 256;
+
 /// 使用 rustyline 运行带历史、补全和基础高亮的控制台。
 fn run_interactive_console(
     sender: Sender<ConsoleInput>,
@@ -173,7 +176,11 @@ fn run_interactive_console(
         completion_provider,
         registry,
     };
-    let mut editor = Editor::<ConsoleHelper, DefaultHistory>::new()?;
+    // 边界:通过 rustyline Config builder 设置历史最大条数,MemHistory 会在溢出时自动淘汰最旧项。
+    let config = rustyline::config::Config::builder()
+        .max_history_size(INTERACTIVE_HISTORY_LIMIT)?
+        .build();
+    let mut editor = Editor::<ConsoleHelper, DefaultHistory>::with_config(config)?;
     editor.set_helper(Some(helper));
     if !options.banner.is_empty() {
         println!("{}", options.banner);

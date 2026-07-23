@@ -65,7 +65,9 @@ pub(crate) async fn serve(state: HttpState) -> HyperResult<()> {
             let mut builder = http1::Builder::new();
             builder.timer(TokioTimer::new());
             // 始终显式设置:超时为 0 时传 None 明确禁用 hyper 自带的 30s 默认值。
-            builder.header_read_timeout((!header_read_timeout.is_zero()).then_some(header_read_timeout));
+            builder.header_read_timeout(
+                (!header_read_timeout.is_zero()).then_some(header_read_timeout),
+            );
             // 单连接错误通常来自客户端提前断开,不能影响监听循环。
             let _ = builder.serve_connection(io, service).await;
         });
@@ -78,7 +80,13 @@ async fn forward_incoming(state: HttpState, request: http::Request<Incoming>) ->
     let request = http::Request::from_parts(parts, Body::new(body));
     forward_request(state, request)
         .await
-        .unwrap_or_else(|error| (StatusCode::BAD_GATEWAY, format!("{error}\n")).into_response())
+        .unwrap_or_else(internal_proxy_error)
+}
+
+/// 记录内部 version 转发错误并向公网返回固定响应。
+fn internal_proxy_error(error: HyperError) -> Response {
+    eprintln!("gateway proxy request failed: {error}");
+    (StatusCode::BAD_GATEWAY, "service temporarily unavailable\n").into_response()
 }
 
 /// 执行单次请求转发,并把响应流和版本租约绑定到同一生命周期。
@@ -142,7 +150,7 @@ async fn forward_request(state: HttpState, request: http::Request<Body>) -> Hype
     let mut response = Response::builder().status(response_parts.status);
 
     for (name, value) in &response_parts.headers {
-        if hop_by_hop_or_framing_header(name) {
+        if !response_header_allowed(name) {
             continue;
         }
         response = response.header(name, value);
@@ -158,6 +166,13 @@ async fn forward_request(state: HttpState, request: http::Request<Body>) -> Hype
     response
         .body(body)
         .map_err(|e| HyperError::new(format!("build response failed: {e}")))
+}
+
+/// 判断 version app 响应 header 是否属于公网协议所需的安全集合。
+fn response_header_allowed(name: &HeaderName) -> bool {
+    name == http::header::CONTENT_TYPE
+        || name == http::header::CONTENT_ENCODING
+        || name == http::header::CACHE_CONTROL
 }
 
 /// 用 active version endpoint 替换请求目标主机,保留原始 path 和 query。
@@ -243,4 +258,35 @@ fn request_body_should_stream(method: &Method, headers: &HeaderMap) -> bool {
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{internal_proxy_error, response_header_allowed};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use hypergate_core::HyperError;
+
+    /// 公网 502 不得包含 version app、地址、超时或底层网络诊断。
+    #[tokio::test]
+    async fn internal_proxy_error_hides_diagnostics() {
+        let response = internal_proxy_error(HyperError::new(
+            "version request failed: tcp connect to 127.0.0.1:9102 timed out after 30s",
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("stable gateway error body");
+        assert_eq!(body.as_ref(), b"service temporarily unavailable\n");
+    }
+
+    /// 公网响应只保留协议必需 header,内部地址与 Cookie 必须丢弃。
+    #[test]
+    fn response_header_allowlist_drops_internal_metadata() {
+        assert!(response_header_allowed(&http::header::CONTENT_TYPE));
+        assert!(response_header_allowed(&http::header::CACHE_CONTROL));
+        assert!(!response_header_allowed(&http::header::SET_COOKIE));
+        assert!(!response_header_allowed(&http::header::LOCATION));
+        assert!(!response_header_allowed(&http::header::SERVER));
+    }
 }

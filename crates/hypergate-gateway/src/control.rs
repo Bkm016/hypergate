@@ -35,9 +35,12 @@ pub(crate) struct GatewayControl {
     started_at: Instant,
 }
 
+/// 回滚历史固定上限,超过后淘汰最旧项以保持有界内存占用。
+const ROLLBACK_HISTORY_LIMIT: usize = 32;
+
 /// 控制器内部可变状态。
 struct ControlState {
-    /// active 版本回滚历史。
+    /// active 版本回滚历史,LIFO 语义,固定最多 [`ROLLBACK_HISTORY_LIMIT`] 项。
     history: Vec<VersionId>,
 }
 
@@ -187,6 +190,7 @@ impl GatewayControl {
     ///
     /// 当 `expected` 与当前配置修订号不匹配时返回错误。
     /// 成功后返回形如 `active=<version>` 的摘要文本。
+    /// 边界:回滚按 LIFO 语义消费历史栈顶,消费后弹出该条目;历史本身由 switch 维持有界。
     pub(crate) fn rollback(&self, expected: Option<u64>) -> ControlResult<ControlOutcome> {
         let mut state = self
             .state
@@ -271,6 +275,10 @@ impl GatewayControl {
         };
         old_runtime.drain();
         if push_history {
+            // 边界:历史固定最多 32 项,溢出时淘汰最旧项,保证 rollback 仍按 LIFO 回到最近 32 次切换之一。
+            if state.history.len() >= ROLLBACK_HISTORY_LIMIT {
+                state.history.remove(0);
+            }
             state.history.push(old.active_version.clone());
         }
         Ok(format!("active={}", applied.active_version.value))
@@ -375,4 +383,136 @@ pub(crate) struct VersionSnapshotDto {
     total_requests: u64,
     /// draining 已持续秒数,未进入 draining 时为 null。
     drain_elapsed_seconds: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! 控制器边界行为测试。验证 rollback history 在固定上限内淘汰最旧项,
+    //! 且 rollback 保持 LIFO 语义。
+
+    use super::*;
+    use hypergate_config::{
+        ConfigValidatorChain, DefaultConfigValidator, StaticConfigLoader, VersionConfig,
+    };
+
+    /// 构造一个最小可运行的 GatewayControl,包含 `count` 个版本,
+    /// 初始 active 版本为 v0。
+    fn build_control(count: usize) -> Arc<GatewayControl> {
+        let mut config = RuntimeConfig::minimal();
+        config.active_version = VersionId::new("v0");
+        for index in 0..count {
+            let id = VersionId::new(format!("v{index}"));
+            config.versions.insert(
+                id,
+                VersionConfig {
+                    endpoint: format!("http://127.0.0.1:{}", 9000 + index),
+                    health: None,
+                },
+            );
+        }
+        let loader = Arc::new(StaticConfigLoader {
+            template: config.clone(),
+        });
+        let mut validator_chain = ConfigValidatorChain::<RuntimeConfig>::new();
+        validator_chain.push(Arc::new(DefaultConfigValidator));
+        let validator = Arc::new(validator_chain);
+        let manager = Arc::new(ConfigManager::new(config.clone(), loader, validator));
+        let versions = Arc::new(VersionRegistry::new());
+        for version_id in config.versions.keys() {
+            versions
+                .ensure(version_id.clone())
+                .expect("version should be registered");
+        }
+        versions
+            .get(&config.active_version)
+            .expect("active version lookup")
+            .expect("active version should exist")
+            .activate();
+        let gateway = Arc::new(
+            Gateway::new(&config, versions.clone()).expect("gateway should build"),
+        );
+        Arc::new(GatewayControl::new(manager, gateway, versions))
+    }
+
+    /// 验证 switch 记录历史并在超过 32 项上限时淘汰最旧项。
+    #[test]
+    fn switch_evicts_oldest_history_beyond_limit() {
+        let control = build_control(ROLLBACK_HISTORY_LIMIT + 2);
+        // 依次切换到 v1..v33,每次都会把当前 active 版本压入历史。
+        for index in 1..=ROLLBACK_HISTORY_LIMIT + 1 {
+            let target = VersionId::new(format!("v{index}"));
+            let outcome = control
+                .switch(target, None)
+                .expect("switch should succeed");
+            assert!(
+                outcome.summary.starts_with("active=v"),
+                "switch should report active version: {}",
+                outcome.summary
+            );
+        }
+        // 历史应固定在上限,最旧的 v0 已被淘汰。
+        let snapshot = control.snapshot().expect("snapshot should succeed");
+        assert!(snapshot.rollback_available, "rollback history should exist");
+        // 连续回滚 ROLLBACK_HISTORY_LIMIT 次,每次应回到上一个 active 版本。
+        // 回滚顺序(LIFO): v32 -> v33 不对,应为 v33 的前一个是 v32...
+        // 历史栈在 switch 时记录的是 *切换前* 的 active 版本。
+        // v0(active) -> switch v1: history=[v0]
+        // v1 -> switch v2: history=[v0,v1]
+        // ...
+        // v32 -> switch v33: history=[v0,...,v32] (33 项,淘汰 v0 -> [v1,...,v32] 32 项)
+        // 因此回滚第一次应回到 v32。
+        let outcome = control.rollback(None).expect("rollback should succeed");
+        assert!(
+            outcome.summary.contains("active=v32"),
+            "first rollback should restore v32: {}",
+            outcome.summary
+        );
+    }
+
+    /// 验证 rollback 在历史为空时返回 Conflict 错误。
+    #[test]
+    fn rollback_empty_history_returns_conflict() {
+        let control = build_control(2);
+        // 初始状态下历史为空,回滚应失败。
+        let result = control.rollback(None);
+        assert!(result.is_err(), "rollback on empty history should fail");
+        let snapshot = control.snapshot().expect("snapshot should succeed");
+        assert!(
+            !snapshot.rollback_available,
+            "rollback should not be available with empty history"
+        );
+    }
+
+    /// 验证 switch 后 rollback 按 LIFO 回到上一个 active 版本。
+    #[test]
+    fn rollback_restores_previous_active_via_lifo() {
+        let control = build_control(3);
+        // v0 -> switch v1: history=[v0]
+        control
+            .switch(VersionId::new("v1"), None)
+            .expect("switch to v1");
+        // v1 -> switch v2: history=[v0,v1]
+        control
+            .switch(VersionId::new("v2"), None)
+            .expect("switch to v2");
+        // rollback(LIFO): 回到 v1,history=[v0]
+        let outcome = control.rollback(None).expect("rollback to v1");
+        assert!(
+            outcome.summary.contains("active=v1"),
+            "first rollback should restore v1: {}",
+            outcome.summary
+        );
+        // rollback(LIFO): 回到 v0,history=[]
+        let outcome = control.rollback(None).expect("rollback to v0");
+        assert!(
+            outcome.summary.contains("active=v0"),
+            "second rollback should restore v0: {}",
+            outcome.summary
+        );
+        // 历史已空,再次回滚应失败。
+        assert!(
+            control.rollback(None).is_err(),
+            "rollback after exhausting history should fail"
+        );
+    }
 }

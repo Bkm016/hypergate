@@ -47,8 +47,7 @@ fn build_client(connect_timeout: Duration) -> VersionClient {
     let mut connector = HttpConnector::new();
     // 建立连接阶段挂起会拖垮 gateway,这里给出明确上限。
     connector.set_connect_timeout(connect_timeout_option(connect_timeout));
-    Client::builder(TokioExecutor::new())
-        .build(connector)
+    Client::builder(TokioExecutor::new()).build(connector)
 }
 
 /// 把 `Duration` 转成 connector 期望的 `Option<Duration>`。
