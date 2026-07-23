@@ -70,9 +70,11 @@ async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResul
     ));
     let state = HttpState {
         gateway: gateway.clone(),
-        clients: VersionClients::new(),
+        // version app 连接超时直接由 server 配置驱动,避免重复配置源。
+        clients: VersionClients::new(config.server.version_connect_timeout),
         classifier: Arc::new(DefaultRequestKindClassifier),
         body_policy: ProxyBodyPolicy::default(),
+        server: config.server.clone(),
     };
     let (console_tx, console_rx) = std::sync::mpsc::channel();
 
@@ -95,7 +97,7 @@ async fn run_app(config: RuntimeConfig, registry: CommandRegistry) -> HyperResul
     // HTTP 服务和控制循环共享同一套配置快照与版本运行态。
     tokio::spawn(control_loop(registry, command_state, console_rx));
 
-    let proxy_future = crate::http::serve(state, listen);
+    let proxy_future = crate::http::serve(state);
     match admin {
         Some(admin_config) => {
             let admin_listen = admin_config.listen();

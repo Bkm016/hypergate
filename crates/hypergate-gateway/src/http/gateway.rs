@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::runtime::{VersionLease, VersionRegistry, VersionRuntime};
 use arc_swap::ArcSwap;
 use http::uri::{Authority, Scheme};
-use hypergate_config::RuntimeConfig;
+use hypergate_config::{RuntimeConfig, ServerConfig};
 use hypergate_core::{HyperError, HyperResult, RequestKind};
 
 use super::{ProxyBodyPolicy, RequestKindClassifier, VersionClients};
@@ -139,4 +139,8 @@ pub(crate) struct HttpState {
     pub(crate) classifier: Arc<dyn RequestKindClassifier>,
     /// 反代请求体策略。
     pub(crate) body_policy: ProxyBodyPolicy,
+    /// 对外 HTTP 服务配置。直接持有配置快照,避免重复字段或无职责 wrapper;
+    /// `proxy::serve` 据此施加连接上限与请求头超时,`forward_request` 据此
+    /// 施加 version app 响应头等待。
+    pub(crate) server: ServerConfig,
 }
