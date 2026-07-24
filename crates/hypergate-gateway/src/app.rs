@@ -1,8 +1,9 @@
 //! 可复用 gateway 运行器。调用方负责提供运行配置。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::control::GatewayControl;
+use crate::control::{GatewayControl, normalize_history};
 use crate::http::{
     DefaultRequestKindClassifier, Gateway, HealthChecker, HttpState, ProxyBodyPolicy,
     VersionClients,
@@ -52,9 +53,8 @@ pub(crate) async fn run(args: Vec<String>) -> HyperResult<()> {
             persisted.active_version.value
         )));
     }
-    persisted
-        .history
-        .retain(|version| config.versions.contains_key(version));
+    let configured = config.versions.keys().cloned().collect::<HashSet<_>>();
+    normalize_history(&mut persisted.history, &configured);
     state_store.save(&persisted)?;
     config.revision = persisted.revision;
     config.active_version = persisted.active_version.clone();

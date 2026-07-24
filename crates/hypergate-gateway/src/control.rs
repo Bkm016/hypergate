@@ -46,6 +46,14 @@ pub(crate) struct GatewayControl {
 /// 回滚历史固定上限,超过后淘汰最旧项以保持有界内存占用。
 const ROLLBACK_HISTORY_LIMIT: usize = 32;
 
+/// 过滤已移除版本并只保留最近的回滚记录。
+pub(crate) fn normalize_history(history: &mut Vec<VersionId>, configured: &HashSet<VersionId>) {
+    history.retain(|version| configured.contains(version));
+    if history.len() > ROLLBACK_HISTORY_LIMIT {
+        history.drain(..history.len() - ROLLBACK_HISTORY_LIMIT);
+    }
+}
+
 /// 控制器内部可变状态。
 struct ControlState {
     /// active 版本回滚历史,LIFO 语义,固定最多 [`ROLLBACK_HISTORY_LIMIT`] 项。
@@ -106,9 +114,16 @@ impl GatewayControl {
         gateway: Arc<Gateway>,
         versions: Arc<VersionRegistry>,
         state_store: Arc<StateStore>,
-        history: Vec<VersionId>,
+        mut history: Vec<VersionId>,
         health_checker: Arc<dyn VersionHealthChecker>,
     ) -> Self {
+        let configured = manager
+            .snapshot()
+            .versions
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        normalize_history(&mut history, &configured);
         Self {
             manager,
             gateway,
@@ -317,7 +332,7 @@ impl GatewayControl {
             .map_err(|error| {
                 ControlError::Conflict(format!("active version health check failed: {error}"))
             })?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| ControlError::Internal(HyperError::new("control lock poisoned")))?;
@@ -333,12 +348,15 @@ impl GatewayControl {
             }
         }
         let configured = next.versions.keys().cloned().collect::<HashSet<_>>();
+        let mut next_history = state.history.clone();
+        normalize_history(&mut next_history, &configured);
         self.versions
             .retain_configured(&configured)
             .map_err(ControlError::Internal)?;
-        self.persist_state(next.revision, &next.active_version, &state.history)?;
+        self.persist_state(next.revision, &next.active_version, &next_history)?;
         self.manager.apply_validated(next);
         self.gateway.swap_active(prepared);
+        state.history = next_history;
         Ok(self.outcome(&state, "reload=ok".to_owned()))
     }
 
@@ -360,13 +378,12 @@ impl GatewayControl {
         }
         let mut next_history = state.history.clone();
         if push_history {
-            if next_history.len() >= ROLLBACK_HISTORY_LIMIT {
-                next_history.remove(0);
-            }
             next_history.push(old.active_version.clone());
         } else {
             next_history.pop();
         }
+        let configured = old.versions.keys().cloned().collect::<HashSet<_>>();
+        normalize_history(&mut next_history, &configured);
         let mut next = old.as_ref().clone();
         next.revision = next.revision.next();
         next.active_version = next_version.clone();
@@ -568,8 +585,27 @@ mod tests {
 
     use super::*;
     use hypergate_config::{
-        ConfigValidatorChain, DefaultConfigValidator, StaticConfigLoader, VersionConfig,
+        ConfigLoader, ConfigValidatorChain, DefaultConfigValidator, VersionConfig,
     };
+    use std::path::PathBuf;
+
+    struct MutableConfigLoader {
+        template: Mutex<RuntimeConfig>,
+    }
+
+    impl MutableConfigLoader {
+        fn replace(&self, template: RuntimeConfig) {
+            *self.template.lock().expect("config loader lock") = template;
+        }
+    }
+
+    impl ConfigLoader<RuntimeConfig> for MutableConfigLoader {
+        fn load(&self, next_revision: ConfigRevision) -> HyperResult<RuntimeConfig> {
+            let mut config = self.template.lock().expect("config loader lock").clone();
+            config.revision = next_revision;
+            Ok(config)
+        }
+    }
 
     struct AlwaysHealthy;
 
@@ -608,6 +644,23 @@ mod tests {
         count: usize,
         health_checker: Arc<dyn VersionHealthChecker>,
     ) -> Arc<GatewayControl> {
+        build_control_parts(count, health_checker).0
+    }
+
+    /// 构造可替换加载配置并检查持久化状态的控制器。
+    fn build_control_parts(
+        count: usize,
+        health_checker: Arc<dyn VersionHealthChecker>,
+    ) -> (Arc<GatewayControl>, Arc<MutableConfigLoader>, PathBuf) {
+        build_control_parts_with_history(count, health_checker, Vec::new())
+    }
+
+    /// 使用指定的持久化历史构造控制器。
+    fn build_control_parts_with_history(
+        count: usize,
+        health_checker: Arc<dyn VersionHealthChecker>,
+        history: Vec<VersionId>,
+    ) -> (Arc<GatewayControl>, Arc<MutableConfigLoader>, PathBuf) {
         let mut config = RuntimeConfig::minimal();
         config.active_version = VersionId::new("v0");
         for index in 0..count {
@@ -620,13 +673,17 @@ mod tests {
                 },
             );
         }
-        let loader = Arc::new(StaticConfigLoader {
-            template: config.clone(),
+        let loader = Arc::new(MutableConfigLoader {
+            template: Mutex::new(config.clone()),
         });
         let mut validator_chain = ConfigValidatorChain::<RuntimeConfig>::new();
         validator_chain.push(Arc::new(DefaultConfigValidator));
         let validator = Arc::new(validator_chain);
-        let manager = Arc::new(ConfigManager::new(config.clone(), loader, validator));
+        let manager = Arc::new(ConfigManager::new(
+            config.clone(),
+            loader.clone(),
+            validator,
+        ));
         let versions = Arc::new(VersionRegistry::new());
         for version_id in config.versions.keys() {
             versions
@@ -643,14 +700,15 @@ mod tests {
         let state_file = tempfile::NamedTempFile::new().expect("state temp file");
         let state_path = state_file.path().to_path_buf();
         drop(state_file);
-        Arc::new(GatewayControl::with_health_checker(
+        let control = Arc::new(GatewayControl::with_health_checker(
             manager,
             gateway,
             versions,
-            Arc::new(StateStore::new(state_path)),
-            Vec::new(),
+            Arc::new(StateStore::new(state_path.clone())),
+            history,
             health_checker,
-        ))
+        ));
+        (control, loader, state_path)
     }
 
     /// 健康检查失败时不能修改 active version、revision 或回滚历史。
@@ -750,5 +808,74 @@ mod tests {
             control.rollback(None).await.is_err(),
             "rollback after exhausting history should fail"
         );
+    }
+
+    /// Reload 删除版本时必须同时清理内存与持久化历史，并保留仍有效的回滚目标。
+    #[tokio::test]
+    async fn reload_removes_deleted_versions_from_rollback_history() {
+        let (control, loader, state_path) = build_control_parts(3, Arc::new(AlwaysHealthy));
+        control
+            .switch(VersionId::new("v1"), None)
+            .await
+            .expect("switch to v1");
+        control
+            .switch(VersionId::new("v2"), None)
+            .await
+            .expect("switch to v2");
+        control
+            .stop(VersionId::new("v1"), None)
+            .expect("v1 should stop after draining");
+
+        let mut next = control.manager.snapshot().as_ref().clone();
+        next.versions.remove(&VersionId::new("v1"));
+        loader.replace(next);
+        control.reload(None).await.expect("reload should succeed");
+
+        let persisted = StateStore::new(state_path)
+            .load_or_initialize(VersionId::new("unused"))
+            .expect("persisted state should load");
+        assert_eq!(persisted.history, vec![VersionId::new("v0")]);
+        let outcome = control.rollback(None).await.expect("rollback to v0");
+        assert_eq!(outcome.summary, "active=v0");
+    }
+
+    /// Reload 删除唯一历史版本后必须关闭 rollback 可用标记并清空状态文件。
+    #[tokio::test]
+    async fn reload_clears_rollback_when_all_history_versions_are_deleted() {
+        let (control, loader, state_path) = build_control_parts(2, Arc::new(AlwaysHealthy));
+        control
+            .switch(VersionId::new("v1"), None)
+            .await
+            .expect("switch to v1");
+        control
+            .stop(VersionId::new("v0"), None)
+            .expect("v0 should stop after draining");
+
+        let mut next = control.manager.snapshot().as_ref().clone();
+        next.versions.remove(&VersionId::new("v0"));
+        loader.replace(next);
+        control.reload(None).await.expect("reload should succeed");
+
+        let snapshot = control.snapshot().expect("snapshot should succeed");
+        assert!(!snapshot.rollback_available);
+        let persisted = StateStore::new(state_path)
+            .load_or_initialize(VersionId::new("unused"))
+            .expect("persisted state should load");
+        assert!(persisted.history.is_empty());
+        assert!(control.rollback(None).await.is_err());
+    }
+
+    /// 控制器恢复旧状态时必须过滤失效版本，并只保留最近 32 项历史。
+    #[test]
+    fn restored_history_is_filtered_and_capped() {
+        let mut history = vec![VersionId::new("deleted")];
+        history.extend((0..40).map(|index| VersionId::new(format!("v{index}"))));
+        let (control, _, _) =
+            build_control_parts_with_history(40, Arc::new(AlwaysHealthy), history);
+
+        let state = control.state.lock().expect("control state lock");
+        assert_eq!(state.history.len(), ROLLBACK_HISTORY_LIMIT);
+        assert_eq!(state.history.first(), Some(&VersionId::new("v8")));
+        assert_eq!(state.history.last(), Some(&VersionId::new("v39")));
     }
 }
