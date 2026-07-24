@@ -15,6 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hypergate_core::{HyperError, HyperResult};
+use tokio::io::{AsyncWriteExt, copy, split};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -418,15 +419,22 @@ async fn relay_upgrades(
     let upstream = upstream
         .await
         .map_err(|error| HyperError::new(format!("version upgrade failed: {error}")))?;
-    let mut client = TokioIo::new(client);
-    let mut upstream = TokioIo::new(upstream);
-    tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
-            result.map_err(|error| HyperError::new(format!("websocket copy failed: {error}")))?;
+    let (mut client_read, mut client_write) = split(TokioIo::new(client));
+    let (mut upstream_read, mut upstream_write) = split(TokioIo::new(upstream));
+    // 任一 TCP 方向结束都表示隧道已失去完整双工语义，立即取消另一方向，
+    // 避免只发送不读取的上游长期持有已经断开的客户端租约。
+    let result = tokio::select! {
+        result = copy(&mut client_read, &mut upstream_write) => {
+            result.map_err(|error| HyperError::new(format!("websocket client copy failed: {error}")))
         }
-        _ = cancel.cancelled() => {}
-    }
-    Ok(())
+        result = copy(&mut upstream_read, &mut client_write) => {
+            result.map_err(|error| HyperError::new(format!("websocket upstream copy failed: {error}")))
+        }
+        _ = cancel.cancelled() => Ok(0),
+    };
+    let _ = client_write.shutdown().await;
+    let _ = upstream_write.shutdown().await;
+    result.map(|_| ())
 }
 
 /// 判断请求体是否需要作为流转发给 version app。
@@ -623,6 +631,27 @@ mod tests {
         stack.stop().await;
     }
 
+    /// 客户端断开时必须结束只推送不读取的上游隧道，并释放版本流租约。
+    #[tokio::test]
+    async fn websocket_client_disconnect_releases_push_only_upstream_lease() {
+        let stack = TestStack::start().await;
+        let (socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/ws-push", stack.gateway_addr))
+                .await
+                .expect("websocket should connect through gateway");
+        assert_eq!(stack.version.snapshot().active_streams, 1);
+
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stack.version.snapshot().active_streams != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client disconnect should release stream lease");
+        stack.stop().await;
+    }
+
     /// Chunked 请求体超过限制后必须返回 413，不能伪装成上游 502。
     #[tokio::test]
     async fn chunked_body_limit_returns_payload_too_large() {
@@ -650,6 +679,7 @@ mod tests {
         upstream_shutdown: CancellationToken,
         gateway: JoinHandle<HyperResult<()>>,
         upstream: JoinHandle<Result<(), std::io::Error>>,
+        version: Arc<crate::runtime::VersionRuntime>,
     }
 
     impl TestStack {
@@ -670,6 +700,7 @@ mod tests {
                     Router::new()
                         .route("/headers", get(header_response))
                         .route("/ws", get(websocket_echo))
+                        .route("/ws-push", get(websocket_push_only))
                         .route("/upload", post(upload_body))
                         .route("/health", get(|| async { StatusCode::NO_CONTENT })),
                 )
@@ -688,10 +719,10 @@ mod tests {
                 },
             );
             let versions = Arc::new(VersionRegistry::new());
-            versions
+            let version = versions
                 .ensure(config.active_version.clone())
-                .expect("version should register")
-                .activate();
+                .expect("version should register");
+            version.activate();
             let gateway =
                 Arc::new(Gateway::new(&config, versions).expect("gateway core should initialize"));
             let gateway_listener = TcpListener::bind("127.0.0.1:0")
@@ -717,6 +748,7 @@ mod tests {
                 upstream_shutdown,
                 gateway,
                 upstream,
+                version,
             }
         }
 
@@ -759,6 +791,21 @@ mod tests {
             while let Some(Ok(message)) = socket.next().await {
                 if matches!(message, AxumMessage::Text(_) | AxumMessage::Binary(_))
                     && socket.send(message).await.is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
+    async fn websocket_push_only(upgrade: WebSocketUpgrade) -> Response {
+        upgrade.on_upgrade(|mut socket| async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if socket
+                    .send(AxumMessage::Text("heartbeat".into()))
+                    .await
+                    .is_err()
                 {
                     break;
                 }
