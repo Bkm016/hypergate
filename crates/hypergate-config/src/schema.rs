@@ -47,8 +47,8 @@ impl Default for ServerConfig {
             header_read_timeout: Duration::from_secs(30),
             // 5 秒连接超时足以发现不可达 version app,避免长时间挂起。
             version_connect_timeout: Duration::from_secs(5),
-            // 30 秒响应头等待覆盖绝大多数普通请求,SSE 的首字节通常也在此之内。
-            version_response_header_timeout: Duration::from_secs(30),
+            // 等待 300 秒以覆盖 version app 的长非流式响应,SSE 的首字节通常更早到达。
+            version_response_header_timeout: Duration::from_secs(300),
             version_health_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(30 * 60),
             trusted_proxies: Vec::new(),
