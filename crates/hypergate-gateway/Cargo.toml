@@ -28,6 +28,10 @@ tempfile = "3"
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux 长请求高并发使用 mimalloc，避免 glibc arena 在请求排空后长期保留 RSS。
+mimalloc = { version = "0.1", features = ["v2"] }
+
 [lints]
 workspace = true
 
