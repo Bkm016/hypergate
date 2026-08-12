@@ -10,6 +10,8 @@ description.workspace = true
 hypergate-cli = { path = "../hypergate-cli" }
 hypergate-core = { path = "../hypergate-core" }
 axum.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["server", "service"] }
 tokio.workspace = true
 
 [lints]

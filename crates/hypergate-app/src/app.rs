@@ -9,10 +9,20 @@
 use std::net::SocketAddr;
 
 use axum::Router;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
 use hypergate_core::{HyperError, HyperResult};
 
 use crate::console::VersionAppConsole;
 use crate::options::VersionAppOptions;
+
+/// 单个 HTTP/2 stream 的接收窗口，覆盖业务允许的最大请求体。
+const HTTP2_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+/// HTTP/2 连接接收窗口，避免数百个大 body 平分默认窗口后串行前进。
+const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 1024 * 1024 * 1024;
+/// 单条 HyperGate 回源连接允许同时承载的请求数。
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
 
 /// Version app 运行器。
 ///
@@ -111,9 +121,25 @@ impl VersionApp {
         let listener = tokio::net::TcpListener::bind(self.options.listen)
             .await
             .map_err(|e| HyperError::new(format!("bind version failed: {e}")))?;
-        axum::serve(listener, self.router)
-            .await
-            .map_err(|e| HyperError::new(format!("serve version failed: {e}")))
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| HyperError::new(format!("accept version connection failed: {e}")))?;
+            let service = TowerToHyperService::new(self.router.clone());
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                builder
+                    .http2()
+                    .initial_stream_window_size(HTTP2_STREAM_WINDOW_BYTES)
+                    .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_BYTES)
+                    .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
+                if let Err(error) = builder.serve_connection_with_upgrades(io, service).await {
+                    eprintln!("version connection failed: {error}");
+                }
+            });
+        }
     }
 }
 

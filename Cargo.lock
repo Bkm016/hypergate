@@ -466,6 +466,8 @@ name = "hypergate-app"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "hyper",
+ "hyper-util",
  "hypergate-cli",
  "hypergate-core",
  "tokio",

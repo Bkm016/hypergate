@@ -26,6 +26,13 @@ use super::body::LimitedBodyStream;
 use super::gateway::PreparedEndpoint;
 use super::stream::LeaseStream;
 
+/// 单个 HTTP/2 stream 的接收窗口，覆盖 version app 允许的最大请求体。
+const HTTP2_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+/// HTTP/2 连接接收窗口，高并发大请求不能共享默认小窗口串行前进。
+const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 1024 * 1024 * 1024;
+/// 单条内部 h2c 连接允许同时承载的 stream 数量。
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
+
 /// 启动 HTTP 服务。监听地址取自 `state.server.listen`,避免重复传参。
 pub(crate) async fn serve(state: HttpState, shutdown: CancellationToken) -> HyperResult<()> {
     let listen = state.server.listen;
@@ -88,7 +95,12 @@ async fn serve_listener(
                     .then_some(connection_header_read_timeout),
             );
             // HTTP/2 按 stream 多路复用，不套用面向 HTTP/1 首部读取的连接超时。
-            builder.http2().timer(TokioTimer::new());
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .initial_stream_window_size(HTTP2_STREAM_WINDOW_BYTES)
+                .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_BYTES)
+                .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
             // 单连接错误通常来自客户端提前断开,不能影响监听循环。
             let connection = builder.serve_connection_with_upgrades(io, service);
             tokio::pin!(connection);
