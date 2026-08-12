@@ -19,7 +19,7 @@ axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = ["server"] }
 http.workspace = true
 ipnet = "2"
 serde = { version = "1", features = ["derive"] }
@@ -36,4 +36,5 @@ mimalloc = { version = "0.1", features = ["v2"] }
 workspace = true
 
 [dev-dependencies]
+axum = { workspace = true, features = ["ws"] }
 tokio-tungstenite = "0.29"

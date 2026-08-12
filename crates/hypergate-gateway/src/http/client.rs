@@ -19,6 +19,8 @@ pub(crate) struct VersionClients {
     pub(crate) unary: VersionClient,
     /// 流式请求客户端。与短请求连接池隔离,避免长连接占用短请求池。
     pub(crate) streaming: VersionClient,
+    /// WebSocket 客户端。HTTP/1.1 Upgrade 不能混入 h2c 请求池。
+    pub(crate) websocket: VersionClient,
 }
 
 impl VersionClients {
@@ -26,9 +28,14 @@ impl VersionClients {
     /// 连接建立阶段;响应头等待由调用侧按请求施加,避免影响 body 流。
     pub(crate) fn new(connect_timeout: Duration) -> Self {
         // 转发热路径使用 hyper client,避免 reqwest 的通用客户端抽象额外开销。
-        let unary = build_client(connect_timeout);
-        let streaming = build_client(connect_timeout);
-        Self { unary, streaming }
+        let unary = build_http2_client(connect_timeout);
+        let streaming = build_http2_client(connect_timeout);
+        let websocket = build_http1_client(connect_timeout);
+        Self {
+            unary,
+            streaming,
+            websocket,
+        }
     }
 
     /// 根据请求类型选择 version app 客户端。
@@ -44,9 +51,19 @@ impl VersionClients {
 ///
 /// 连接超时设置在 connector 上,保证 TCP/TLS 建立阶段即可快速失败。
 /// 响应头等待不在此处设置,因为它需要按请求施加 deadline 且不能影响 body 流。
-fn build_client(connect_timeout: Duration) -> VersionClient {
+fn build_http2_client(connect_timeout: Duration) -> VersionClient {
     let mut connector = HttpConnector::new();
     // 建立连接阶段挂起会拖垮 gateway,这里给出明确上限。
+    connector.set_connect_timeout(connect_timeout_option(connect_timeout));
+    // Version app 固定为本机 h2c 服务，让长流在少量连接上按 stream 多路复用。
+    Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build(connector)
+}
+
+/// 构建仅供 WebSocket Upgrade 使用的 HTTP/1.1 客户端。
+fn build_http1_client(connect_timeout: Duration) -> VersionClient {
+    let mut connector = HttpConnector::new();
     connector.set_connect_timeout(connect_timeout_option(connect_timeout));
     Client::builder(TokioExecutor::new()).build(connector)
 }
@@ -72,7 +89,7 @@ impl HealthChecker {
     /// 创建使用独立连接池的健康检查器。
     pub(crate) fn new(connect_timeout: Duration, timeout: Duration) -> Self {
         Self {
-            client: build_client(connect_timeout),
+            client: build_http2_client(connect_timeout),
             timeout,
         }
     }

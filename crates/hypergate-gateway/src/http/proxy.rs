@@ -11,9 +11,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use http::uri::PathAndQuery;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use hypergate_core::{HyperError, HyperResult};
 use tokio::io::{AsyncWriteExt, copy, split};
 use tokio::net::TcpListener;
@@ -80,15 +80,17 @@ async fn serve_listener(
                 async move { Ok::<_, Infallible>(forward_incoming(state, peer, request).await) }
             });
             // 每个连接任务内新建 Timer,避免 timer 跨循环 move。
-            let mut builder = http1::Builder::new();
-            builder.timer(TokioTimer::new());
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder.http1().timer(TokioTimer::new());
             // 始终显式设置:超时为 0 时传 None 明确禁用 hyper 自带的 30s 默认值。
-            builder.header_read_timeout(
+            builder.http1().header_read_timeout(
                 (!connection_header_read_timeout.is_zero())
                     .then_some(connection_header_read_timeout),
             );
+            // HTTP/2 按 stream 多路复用，不套用面向 HTTP/1 首部读取的连接超时。
+            builder.http2().timer(TokioTimer::new());
             // 单连接错误通常来自客户端提前断开,不能影响监听循环。
-            let connection = builder.serve_connection(io, service).with_upgrades();
+            let connection = builder.serve_connection_with_upgrades(io, service);
             tokio::pin!(connection);
             tokio::select! {
                 _ = &mut connection => {}
@@ -181,7 +183,12 @@ async fn forward_request(
     // 响应头等待只在“拿到响应头之前”施加 deadline,拿到响应头后立即取消定时,
     // 这样响应 body / SSE 流不受总时长限制,避免切断长响应。
     let response_header_timeout = state.server.version_response_header_timeout;
-    let request_future = state.clients.select(kind).request(version_request);
+    let client = if websocket_request {
+        &state.clients.websocket
+    } else {
+        state.clients.select(kind)
+    };
+    let request_future = client.request(version_request);
     let response = async {
         if response_header_timeout.is_zero() {
             request_future
@@ -586,6 +593,24 @@ mod tests {
         stack.stop().await;
     }
 
+    /// 普通请求必须在 Gateway 入站和 version app 回源两跳都使用 HTTP/2。
+    #[tokio::test]
+    async fn proxy_uses_http2_on_both_hops() {
+        let stack = TestStack::start().await;
+        let client = VersionClients::new(Duration::from_secs(1));
+        let request = http::Request::get(format!("http://{}/headers", stack.gateway_addr))
+            .body(Body::empty())
+            .expect("request should build");
+        let response = client
+            .unary
+            .request(request)
+            .await
+            .expect("HTTP/2 gateway request should succeed");
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(response.headers()["x-upstream-http-version"], "HTTP/2.0");
+        stack.stop().await;
+    }
+
     /// WebSocket upgrade 必须穿透 Gateway，并把隧道生命周期计入版本租约。
     #[tokio::test]
     async fn websocket_tunnel_forwards_frames() {
@@ -766,7 +791,7 @@ mod tests {
         }
     }
 
-    async fn header_response() -> Response {
+    async fn header_response(request: axum::extract::Request) -> Response {
         let mut response = Response::new(Body::from("ok"));
         response.headers_mut().append(
             http::header::SET_COOKIE,
@@ -782,6 +807,11 @@ mod tests {
         response.headers_mut().insert(
             HeaderName::from_static("x-hypergate-test"),
             HeaderValue::from_static("forwarded"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-upstream-http-version"),
+            HeaderValue::from_str(&format!("{:?}", request.version()))
+                .expect("HTTP version should be a valid header"),
         );
         response
     }
