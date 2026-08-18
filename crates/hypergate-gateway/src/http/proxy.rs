@@ -31,7 +31,8 @@ const HTTP2_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 /// HTTP/2 连接接收窗口，高并发大请求不能共享默认小窗口串行前进。
 const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 1024 * 1024 * 1024;
 /// 单条内部 h2c 连接允许同时承载的 stream 数量。
-const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
+/// 拉到 65535：慢流式请求占住 stream 时，新请求（含 Dashboard）仍能拿到 stream，不排队。
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 65535;
 
 /// 启动 HTTP 服务。监听地址取自 `state.server.listen`,避免重复传参。
 pub(crate) async fn serve(state: HttpState, shutdown: CancellationToken) -> HyperResult<()> {
@@ -165,6 +166,7 @@ async fn forward_request(
     let should_stream = request_body_should_stream(&parts.method, &parts.headers);
     let body_limit_exceeded = Arc::new(AtomicBool::new(false));
     let websocket_request = client_upgrade.is_some();
+    let dashboard_websocket = websocket_request && parts.uri.path() == "/api/ws";
     let connection_headers = connection_header_names(&parts.headers);
     let mut version_request = http::Request::builder()
         .method(parts.method.clone())
@@ -218,9 +220,14 @@ async fn forward_request(
         }
     };
     let cancel = prepared.lease.cancel_token();
+    let response_cancel = if dashboard_websocket {
+        prepared.lease.dashboard_websocket_cancel_token()
+    } else {
+        cancel
+    };
     let response_result = tokio::select! {
         result = response => result,
-        _ = cancel.cancelled() => {
+        _ = response_cancel.cancelled() => {
             return Err(HyperError::new("version request cancelled while draining"));
         }
     };
@@ -255,7 +262,11 @@ async fn forward_request(
             .ok_or_else(|| HyperError::new("version websocket upgrade is unavailable"))?;
         state.tasks.spawn(async move {
             let lease = prepared.lease;
-            let cancel = lease.cancel_token();
+            let cancel = if dashboard_websocket {
+                lease.dashboard_websocket_cancel_token()
+            } else {
+                lease.cancel_token()
+            };
             if let Err(error) = relay_upgrades(client_upgrade, upstream_upgrade, cancel).await {
                 eprintln!("gateway websocket tunnel failed: {error}");
             }
@@ -689,6 +700,44 @@ mod tests {
         stack.stop().await;
     }
 
+    /// 版本进入 draining 时仅立即关闭 Dashboard WebSocket，其他 WebSocket 继续自然排空。
+    #[tokio::test]
+    async fn draining_closes_only_dashboard_websocket() {
+        let stack = TestStack::start().await;
+        let (mut dashboard, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/api/ws", stack.gateway_addr))
+                .await
+                .expect("dashboard websocket should connect");
+        let (mut other, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/ws", stack.gateway_addr))
+                .await
+                .expect("other websocket should connect");
+        assert_eq!(stack.version.snapshot().active_streams, 2);
+
+        stack.version.drain();
+        let dashboard_closed = tokio::time::timeout(Duration::from_secs(2), dashboard.next())
+            .await
+            .expect("dashboard websocket should close immediately");
+        assert!(!matches!(
+            dashboard_closed,
+            Some(Ok(ClientMessage::Text(_)))
+        ));
+
+        other
+            .send(ClientMessage::Text("still-draining".into()))
+            .await
+            .expect("other websocket should remain writable");
+        assert_eq!(
+            other.next().await.unwrap().unwrap(),
+            ClientMessage::Text("still-draining".into())
+        );
+        other
+            .close(None)
+            .await
+            .expect("other websocket should close");
+        stack.stop().await;
+    }
+
     /// Chunked 请求体超过限制后必须返回 413，不能伪装成上游 502。
     #[tokio::test]
     async fn chunked_body_limit_returns_payload_too_large() {
@@ -736,6 +785,7 @@ mod tests {
                     upstream_listener,
                     Router::new()
                         .route("/headers", get(header_response))
+                        .route("/api/ws", get(websocket_echo))
                         .route("/ws", get(websocket_echo))
                         .route("/ws-push", get(websocket_push_only))
                         .route("/upload", post(upload_body))

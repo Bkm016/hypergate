@@ -37,4 +37,9 @@ impl VersionLease {
     pub(crate) fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
+
+    /// 返回当前版本的 Dashboard WebSocket 即时排水令牌。
+    pub(crate) fn dashboard_websocket_cancel_token(&self) -> CancellationToken {
+        self.version.dashboard_websocket_cancel_token()
+    }
 }

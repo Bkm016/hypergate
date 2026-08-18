@@ -30,6 +30,8 @@ pub(crate) struct VersionRuntime {
     pub(crate) drain_started_at: RwLock<Option<Instant>>,
     /// 当前激活周期的强制排水取消令牌。
     cancel: RwLock<CancellationToken>,
+    /// 当前激活周期的 Dashboard WebSocket 取消令牌，进入 draining 时立即触发。
+    dashboard_websocket_cancel: RwLock<CancellationToken>,
 }
 
 impl VersionRuntime {
@@ -42,6 +44,7 @@ impl VersionRuntime {
             total_requests: AtomicU64::new(0),
             drain_started_at: RwLock::new(None),
             cancel: RwLock::new(CancellationToken::new()),
+            dashboard_websocket_cancel: RwLock::new(CancellationToken::new()),
         }
     }
 
@@ -91,6 +94,13 @@ impl VersionRuntime {
         if cancel.is_cancelled() {
             *cancel = CancellationToken::new();
         }
+        let mut dashboard_websocket_cancel = match self.dashboard_websocket_cancel.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if dashboard_websocket_cancel.is_cancelled() {
+            *dashboard_websocket_cancel = CancellationToken::new();
+        }
         self.set_state(VersionState::Active);
     }
 
@@ -102,6 +112,7 @@ impl VersionRuntime {
         };
         *drain_started_at = Some(Instant::now());
         self.set_state(VersionState::Draining);
+        self.dashboard_websocket_cancel_token().cancel();
     }
 
     /// 无活跃连接时停止版本。
@@ -156,6 +167,14 @@ impl VersionRuntime {
     /// 克隆当前激活周期的取消令牌。
     fn cancel_token(&self) -> CancellationToken {
         match self.cancel.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// 克隆当前激活周期的 Dashboard WebSocket 取消令牌。
+    pub(crate) fn dashboard_websocket_cancel_token(&self) -> CancellationToken {
+        match self.dashboard_websocket_cancel.read() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
