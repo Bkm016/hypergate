@@ -313,8 +313,11 @@ fn build_endpoint_uri(endpoint: &PreparedEndpoint, uri: &http::Uri) -> HyperResu
         .map_err(|e| HyperError::new(format!("invalid version endpoint: {e}")))
 }
 
-/// 通过 `Content-Length` 提前拒绝明显超过上限的请求体。
-fn request_body_too_large(headers: &HeaderMap, limit: usize) -> bool {
+/// 通过 `Content-Length` 提前拒绝明显超过上限的请求体；未设限时直接放行。
+fn request_body_too_large(headers: &HeaderMap, limit: Option<usize>) -> bool {
+    let Some(limit) = limit else {
+        return false;
+    };
     headers
         .get(http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -741,7 +744,7 @@ mod tests {
     /// Chunked 请求体超过限制后必须返回 413，不能伪装成上游 502。
     #[tokio::test]
     async fn chunked_body_limit_returns_payload_too_large() {
-        let stack = TestStack::start_with_limit(4).await;
+        let stack = TestStack::start_with_limit(Some(4)).await;
         let client = VersionClients::new(Duration::from_secs(1));
         let body = Body::from_stream(futures_util::stream::iter(vec![
             Ok::<_, Infallible>(bytes::Bytes::from_static(b"abc")),
@@ -759,6 +762,23 @@ mod tests {
         stack.stop().await;
     }
 
+    /// 默认策略不设限，超大 Content-Length 与流式请求体均应放行给下游。
+    #[test]
+    fn default_body_policy_does_not_limit_request_size() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("1073741824"),
+        );
+        let default_policy = ProxyBodyPolicy::default();
+        assert!(default_policy.max_request_body_bytes.is_none());
+        assert!(!super::request_body_too_large(
+            &headers,
+            default_policy.max_request_body_bytes,
+        ));
+        assert!(super::request_body_too_large(&headers, Some(64 * 1024 * 1024)));
+    }
+
     struct TestStack {
         gateway_addr: SocketAddr,
         gateway_shutdown: CancellationToken,
@@ -770,10 +790,10 @@ mod tests {
 
     impl TestStack {
         async fn start() -> Self {
-            Self::start_with_limit(ProxyBodyPolicy::DEFAULT_MAX_REQUEST_BODY_BYTES).await
+            Self::start_with_limit(ProxyBodyPolicy::default().max_request_body_bytes).await
         }
 
-        async fn start_with_limit(max_request_body_bytes: usize) -> Self {
+        async fn start_with_limit(max_request_body_bytes: Option<usize>) -> Self {
             let upstream_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("upstream should bind");
